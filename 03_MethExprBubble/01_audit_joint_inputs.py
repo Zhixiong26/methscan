@@ -40,7 +40,19 @@ def bool_series(values: pd.Series) -> pd.Series:
     return values.astype(str).str.lower().isin({"1", "true", "t", "yes", "y"})
 
 
-def read_ratio_header(path: Path) -> tuple[list[str], int, set[str]]:
+def chromosome_sort_key(chrom: str) -> tuple[int, str]:
+    if chrom.startswith("chr"):
+        suffix = chrom[3:]
+        if suffix.isdigit() and 1 <= int(suffix) <= 22:
+            return int(suffix), ""
+        if suffix == "X":
+            return 23, ""
+        if suffix == "Y":
+            return 24, ""
+    return 1000, chrom
+
+
+def read_ratio_header(path: Path) -> tuple[list[str], int, set[str], bool]:
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         header = handle.readline().rstrip("\n\r").split("\t")
         if header[:4] != ["chrom", "start", "end", "dmr_id"]:
@@ -50,23 +62,28 @@ def read_ratio_header(path: Path) -> tuple[list[str], int, set[str]]:
             fail(f"Missing or duplicated matrix cells: {path}")
         dmrs = 0
         chroms: set[str] = set()
-        previous: tuple[str, int] | None = None
+        previous: tuple[tuple[int, str], int, int] | None = None
+        rows_genomically_ordered = True
+        seen_dmr_ids: set[str] = set()
         for line_number, line in enumerate(handle, start=2):
             fields = line.rstrip("\n\r").split("\t", 4)
             if len(fields) != 5:
                 fail(f"Malformed matrix row: {path}:{line_number}")
-            chrom, start_text, end_text, _dmr_id, _values = fields
+            chrom, start_text, end_text, dmr_id, _values = fields
             start = int(start_text)
             end = int(end_text)
             if start < 0 or end <= start:
                 fail(f"Invalid DMR interval: {path}:{line_number}")
-            key = (chrom, start)
+            if not dmr_id or dmr_id in seen_dmr_ids:
+                fail(f"Missing or duplicated DMR ID: {path}:{line_number}: {dmr_id}")
+            seen_dmr_ids.add(dmr_id)
+            key = (chromosome_sort_key(chrom), start, end)
             if previous is not None and key < previous:
-                fail(f"DMR rows are not ordered: {path}:{line_number}")
+                rows_genomically_ordered = False
             previous = key
             chroms.add(chrom)
             dmrs += 1
-    return cells, dmrs, chroms
+    return cells, dmrs, chroms, rows_genomically_ordered
 
 
 def main() -> int:
@@ -109,7 +126,9 @@ def main() -> int:
                 f"{sample_name}: missing inputs: {missing_sample}; cov_dir={sample_cov_dir}"
             )
 
-        matrix_cells, dmr_count, chroms = read_ratio_header(matrix_path)
+        matrix_cells, dmr_count, chroms, rows_genomically_ordered = read_ratio_header(
+            matrix_path
+        )
         nonprimary = sorted(chroms.difference(PRIMARY_CHROMS))
         if nonprimary:
             fail(f"{sample_name}: non-primary DMR chromosomes: {nonprimary[:10]}")
@@ -137,6 +156,7 @@ def main() -> int:
                 "matrix_cells": len(matrix_cells),
                 "dmrs": dmr_count,
                 "matrix_chromosomes": len(chroms),
+                "matrix_rows_genomically_ordered": rows_genomically_ordered,
                 "selected_cell_types": len(sample_types),
                 "cov_files": cov_files,
                 "missing_selected_cov": missing_cov,
@@ -180,6 +200,7 @@ def main() -> int:
         "gencode_release": "v44",
         "reference_assembly": "GRCh38/hg38",
         "dmr_chromosome_rule": "chr1-chr22,chrX,chrY",
+        "dmr_matrix_row_order_rule": "order is audited but not required; downstream joins by DMR ID",
         "status": "PASS",
     }
     (output_dir / "audit_summary.json").write_text(
