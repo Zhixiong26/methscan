@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Merge methylation/expression summaries and draw aligned three-panel bubbles."""
+"""Merge summaries and draw aligned gene-body methylation/expression bubbles."""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ def build_plot_table(
     markers = markers.sort_values("plot_row", kind="stable").copy()
     cell_types = ordered_cell_types(expression["cell_type"].astype(str).unique().tolist())
     base = pd.MultiIndex.from_product(
-        [markers["gene_symbol"].astype(str), cell_types, ["promoter", "gene_body"]],
+        [markers["gene_symbol"].astype(str), cell_types, ["gene_body"]],
         names=["gene_symbol", "cell_type", "region"],
     ).to_frame(index=False)
     marker_meta = markers[
@@ -117,7 +117,7 @@ def build_plot_table(
         columns={"mean_methylation_probability": "methylation_probability"}
     )
     cell_order = {value: index for index, value in enumerate(cell_types)}
-    region_order = {"promoter": 0, "gene_body": 1}
+    region_order = {"gene_body": 0}
     base["_cell_order"] = base["cell_type"].map(cell_order)
     base["_region_order"] = base["region"].map(region_order)
     return base.sort_values(
@@ -214,15 +214,14 @@ def main() -> None:
     markers = markers.sort_values("plot_row", kind="stable").reset_index(drop=True)
     genes = markers["gene_symbol"].astype(str).tolist()
     cell_types = ordered_cell_types(expression["cell_type"].astype(str).unique().tolist())
-    promoter = plot_table.loc[plot_table["region"] == "promoter"]
     gene_body = plot_table.loc[plot_table["region"] == "gene_body"]
-    expression_once = promoter
+    expression_once = gene_body
 
     height = max(10.0, 0.24 * len(genes) + 3.3)
-    width = max(24.0, 1.55 * len(cell_types) + 6.0)
+    width = max(17.0, 1.05 * len(cell_types) + 5.0)
     figure, axes = plt.subplots(
         1,
-        3,
+        2,
         figsize=(width, height),
         sharey=True,
         constrained_layout=True,
@@ -231,19 +230,6 @@ def main() -> None:
     expression_norm = Normalize(-args.expression_z_clip, args.expression_z_clip)
     draw_panel(
         axes[0],
-        promoter,
-        "methylation_probability",
-        "valid_cell_fraction",
-        "Promoter methylation",
-        "Reds",
-        methyl_norm,
-        genes,
-        cell_types,
-        args.min_dot_size,
-        args.max_dot_size,
-    )
-    draw_panel(
-        axes[1],
         gene_body,
         "methylation_probability",
         "valid_cell_fraction",
@@ -256,7 +242,7 @@ def main() -> None:
         args.max_dot_size,
     )
     draw_panel(
-        axes[2],
+        axes[1],
         expression_once,
         "scaled_mean_expression",
         "expression_fraction",
@@ -270,8 +256,7 @@ def main() -> None:
     )
     axes[0].set_yticklabels(genes, fontsize=8)
     axes[0].set_ylabel("Top marker genes (grouped by marker cell type)", fontsize=11)
-    for ax in axes[1:]:
-        ax.tick_params(axis="y", labelleft=False)
+    axes[1].tick_params(axis="y", labelleft=False)
     for ax in axes:
         ax.set_xlabel("Cell type", fontsize=10)
 
@@ -297,16 +282,16 @@ def main() -> None:
 
     methyl_mappable = plt.cm.ScalarMappable(norm=methyl_norm, cmap="Reds")
     expression_mappable = plt.cm.ScalarMappable(norm=expression_norm, cmap="RdBu_r")
-    methyl_bar = figure.colorbar(methyl_mappable, ax=axes[:2], shrink=0.55, pad=0.015)
+    methyl_bar = figure.colorbar(methyl_mappable, ax=axes[0], shrink=0.55, pad=0.015)
     methyl_bar.set_label("Mean methylation probability", fontsize=9)
-    expression_bar = figure.colorbar(expression_mappable, ax=axes[2], shrink=0.55, pad=0.015)
+    expression_bar = figure.colorbar(expression_mappable, ax=axes[1], shrink=0.55, pad=0.015)
     expression_bar.set_label("Gene-wise Z-score of mean expression", fontsize=9)
 
     legend_handles = [
-        axes[2].scatter([], [], s=dot_sizes(np.array([fraction]), args.min_dot_size, args.max_dot_size)[0], color="#777777", label=f"{fraction:.0%}")
+        axes[1].scatter([], [], s=dot_sizes(np.array([fraction]), args.min_dot_size, args.max_dot_size)[0], color="#777777", label=f"{fraction:.0%}")
         for fraction in (0.2, 0.5, 1.0)
     ]
-    axes[2].legend(
+    axes[1].legend(
         handles=legend_handles,
         title="Cell fraction\n(size)",
         loc="upper left",
@@ -316,21 +301,21 @@ def main() -> None:
         title_fontsize=8,
     )
     figure.suptitle(
-        "DMR-supported regional methylation and marker-gene expression",
+        "DMR-supported gene-body methylation and marker-gene expression",
         fontsize=16,
         fontweight="bold",
     )
     figure.text(
         0.5,
         0.002,
-        "Methylation represents only DMR-covered portions of promoter/gene body; blank = insufficient or missing methylation coverage.",
+        "Methylation represents only DMR-covered portions of gene bodies; blank = insufficient or missing methylation coverage.",
         ha="center",
         va="bottom",
         fontsize=8,
         color="#555555",
     )
-    png_path = args.output_dir / "methylation_expression_top5_marker_bubble_plot.png"
-    pdf_path = args.output_dir / "methylation_expression_top5_marker_bubble_plot.pdf"
+    png_path = args.output_dir / "gene_body_methylation_expression_top5_marker_bubble_plot.png"
+    pdf_path = args.output_dir / "gene_body_methylation_expression_top5_marker_bubble_plot.pdf"
     figure.savefig(png_path, dpi=args.dpi, bbox_inches="tight", facecolor="white")
     figure.savefig(pdf_path, bbox_inches="tight", facecolor="white")
     plt.close(figure)
@@ -338,7 +323,6 @@ def main() -> None:
     qc = {
         "marker_genes": len(genes),
         "cell_types": len(cell_types),
-        "promoter_plotted_values": int(promoter["methylation_probability"].notna().sum()),
         "gene_body_plotted_values": int(gene_body["methylation_probability"].notna().sum()),
         "expression_plotted_values": int(expression_once["scaled_mean_expression"].notna().sum()),
         "methylation_color_range": [0, 1],

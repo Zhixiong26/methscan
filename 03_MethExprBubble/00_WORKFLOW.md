@@ -1,10 +1,9 @@
 # 甲基化概率与基因表达联合气泡图
 
-本目录从现有10样本Top200 DMR matrix和Scanpy注释对象生成三个并排面板：
+本目录从现有10样本Top200 DMR matrix和Scanpy注释对象生成两个并排面板：
 
-1. Promoter methylation
-2. Gene-body methylation
-3. Gene expression
+1. Gene-body methylation
+2. Gene expression
 
 默认输出一张合并10个样本的描述性图。中间结果保留`sample`、`cell`和`cell_type`，便于后续改成分样本或IR/NR分组图。
 
@@ -31,7 +30,7 @@
 | 05 | `05_map_dmrs_to_gene_regions.py` | DMR与marker promoter/gene body区间重叠 |
 | 06 | `06_compute_gene_region_methylation.py` | CpG数×overlap比例加权，汇总单细胞和cell type甲基化 |
 | 07 | `07_summarize_marker_expression.py` | 汇总marker表达均值、表达比例和逐基因Z-score |
-| 08 | `08_merge_plot_joint_bubbles.py` | 合并长表并绘制三个并排气泡图 |
+| 08 | `08_merge_plot_joint_bubbles.py` | 合并长表并绘制gene-body甲基化/基因表达两个并排气泡图 |
 
 总控：`run_meth_expr_bubble_workflow.sh`。
 
@@ -101,5 +100,5 @@ dsub \
 - `results/06_region_methylation/celltype_gene_region_methylation.tsv`
 - `results/07_expression/celltype_marker_gene_expression.tsv`
 - `results/08_joint_plot/joint_methylation_expression_bubble_data.tsv.gz`
-- `results/08_joint_plot/methylation_expression_top5_marker_bubble_plot.png`
-- `results/08_joint_plot/methylation_expression_top5_marker_bubble_plot.pdf`
+- `results/08_joint_plot/gene_body_methylation_expression_top5_marker_bubble_plot.png`
+- `results/08_joint_plot/gene_body_methylation_expression_top5_marker_bubble_plot.pdf`
