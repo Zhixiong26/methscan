@@ -15,6 +15,7 @@ import pandas as pd
 from workflow_config import (
     EXCLUDED_CELL_TYPES,
     GENCODE_GTF,
+    PROMOTER_BED,
     RESULT_ROOT,
     RNA_H5AD,
     SAMPLE_NAMES,
@@ -89,7 +90,7 @@ def read_ratio_header(path: Path) -> tuple[list[str], int, set[str], bool]:
 def main() -> int:
     output_dir = RESULT_ROOT / "01_audit"
     output_dir.mkdir(parents=True, exist_ok=True)
-    required = [RNA_H5AD, GENCODE_GTF]
+    required = [RNA_H5AD, GENCODE_GTF, PROMOTER_BED]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Missing global inputs: {missing}")
@@ -197,6 +198,8 @@ def main() -> int:
         "methylation_cell_types": len(meth_types),
         "common_cell_types": type_order,
         "gencode_gtf": str(GENCODE_GTF),
+        "promoter_bed": str(PROMOTER_BED),
+        "promoter_definition": "TSS +/- 2000 bp from external BED",
         "gencode_release": "v44",
         "reference_assembly": "GRCh38/hg38",
         "dmr_chromosome_rule": "chr1-chr22,chrX,chrY",

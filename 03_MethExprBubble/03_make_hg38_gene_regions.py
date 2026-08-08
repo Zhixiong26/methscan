@@ -12,8 +12,8 @@ from pathlib import Path
 
 from workflow_config import (
     GENCODE_GTF,
-    PROMOTER_DOWNSTREAM_BP,
-    PROMOTER_UPSTREAM_BP,
+    PROMOTER_BED,
+    PROMOTER_DEFINITION,
     RESULT_ROOT,
     strip_ensembl_version,
 )
@@ -25,6 +25,7 @@ PRIMARY_CHROMS = {f"chr{i}" for i in range(1, 23)} | {"chrX", "chrY"}
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gtf", type=Path, default=GENCODE_GTF)
+    parser.add_argument("--promoter-bed", type=Path, default=PROMOTER_BED)
     parser.add_argument(
         "--markers",
         type=Path,
@@ -32,10 +33,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir", type=Path, default=RESULT_ROOT / "03_gene_regions"
-    )
-    parser.add_argument("--promoter-upstream", type=int, default=PROMOTER_UPSTREAM_BP)
-    parser.add_argument(
-        "--promoter-downstream", type=int, default=PROMOTER_DOWNSTREAM_BP
     )
     return parser.parse_args()
 
@@ -85,31 +82,71 @@ def read_genes(gtf: Path) -> list[dict[str, object]]:
     return genes
 
 
-def make_regions(
-    genes: list[dict[str, object]], upstream: int, downstream: int
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    promoters: list[dict[str, object]] = []
+def make_gene_bodies(genes: list[dict[str, object]]) -> list[dict[str, object]]:
     bodies: list[dict[str, object]] = []
     for gene in genes:
         body = dict(gene)
         body["region"] = "gene_body"
         bodies.append(body)
+    return bodies
 
-        strand = str(gene["strand"])
-        if strand == "+":
-            tss = int(gene["start"])
-            p_start = max(0, tss - upstream)
-            p_end = tss + downstream
-        elif strand == "-":
-            tss = int(gene["end"]) - 1
-            p_start = max(0, tss - downstream)
-            p_end = tss + upstream
-        else:
-            continue
-        promoter = dict(gene)
-        promoter.update(start=p_start, end=p_end, region="promoter", tss=tss)
-        promoters.append(promoter)
-    return promoters, bodies
+
+def read_external_promoters(
+    path: Path, genes: list[dict[str, object]]
+) -> tuple[list[dict[str, object]], dict[str, int]]:
+    gene_type_by_id = {str(gene["gene_id"]): str(gene["gene_type"]) for gene in genes}
+    promoters: list[dict[str, object]] = []
+    seen: set[tuple[str, int, int, str, str, str]] = set()
+    audit = {
+        "input_rows": 0,
+        "primary_rows": 0,
+        "nonprimary_rows_excluded": 0,
+        "duplicate_rows_excluded": 0,
+    }
+    with open_text(path) as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip() or line.startswith("#"):
+                continue
+            audit["input_rows"] += 1
+            fields = line.rstrip("\n").split("\t")
+            if len(fields) != 6:
+                raise ValueError(
+                    f"{path}:{line_number}: expected 6 BED columns, found {len(fields)}"
+                )
+            chrom, start_text, end_text, gene_id_text, gene_symbol, strand = fields
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError as exc:
+                raise ValueError(f"{path}:{line_number}: non-integer BED coordinate") from exc
+            if start < 0 or end <= start:
+                raise ValueError(f"{path}:{line_number}: invalid BED interval")
+            if strand not in {"+", "-"}:
+                raise ValueError(f"{path}:{line_number}: invalid strand: {strand}")
+            if not gene_symbol:
+                raise ValueError(f"{path}:{line_number}: empty gene symbol")
+            if chrom not in PRIMARY_CHROMS:
+                audit["nonprimary_rows_excluded"] += 1
+                continue
+            gene_id = strip_ensembl_version(gene_id_text)
+            key = (chrom, start, end, gene_id, gene_symbol, strand)
+            if key in seen:
+                audit["duplicate_rows_excluded"] += 1
+                continue
+            seen.add(key)
+            promoters.append(
+                {
+                    "chrom": chrom,
+                    "start": start,
+                    "end": end,
+                    "gene_id": gene_id,
+                    "gene_symbol": gene_symbol,
+                    "gene_type": gene_type_by_id.get(gene_id, ""),
+                    "strand": strand,
+                    "region": "promoter",
+                }
+            )
+            audit["primary_rows"] += 1
+    return promoters, audit
 
 
 def write_bed(path: Path, rows: list[dict[str, object]]) -> None:
@@ -131,10 +168,10 @@ def write_bed(path: Path, rows: list[dict[str, object]]) -> None:
 
 def main() -> None:
     args = parse_args()
-    if args.promoter_upstream < 0 or args.promoter_downstream < 0:
-        raise ValueError("Promoter distances must be non-negative")
     if not args.gtf.is_file():
         raise FileNotFoundError(args.gtf)
+    if not args.promoter_bed.is_file():
+        raise FileNotFoundError(args.promoter_bed)
     if not args.markers.is_file():
         raise FileNotFoundError(args.markers)
 
@@ -142,18 +179,29 @@ def main() -> None:
     genes = read_genes(args.gtf)
     if not genes:
         raise RuntimeError(f"No primary-chromosome gene records read from {args.gtf}")
-    promoters, bodies = make_regions(
-        genes, args.promoter_upstream, args.promoter_downstream
-    )
+    bodies = make_gene_bodies(genes)
+    promoters, promoter_audit = read_external_promoters(args.promoter_bed, genes)
+    if not promoters:
+        raise RuntimeError(f"No primary-chromosome promoters read from {args.promoter_bed}")
 
     with args.markers.open() as handle:
         marker_rows = list(csv.DictReader(handle, delimiter="\t"))
     marker_symbols = {row["gene_symbol"] for row in marker_rows}
 
-    symbol_loci: dict[str, set[tuple[str, int, int, str]]] = defaultdict(set)
+    body_symbol_loci: dict[str, set[tuple[str, int, int, str]]] = defaultdict(set)
     for gene in genes:
-        symbol_loci[str(gene["gene_symbol"])].add(
+        body_symbol_loci[str(gene["gene_symbol"])].add(
             (str(gene["chrom"]), int(gene["start"]), int(gene["end"]), str(gene["strand"]))
+        )
+    promoter_symbol_loci: dict[str, set[tuple[str, int, int, str]]] = defaultdict(set)
+    for promoter in promoters:
+        promoter_symbol_loci[str(promoter["gene_symbol"])].add(
+            (
+                str(promoter["chrom"]),
+                int(promoter["start"]),
+                int(promoter["end"]),
+                str(promoter["strand"]),
+            )
         )
 
     marker_promoters = [r for r in promoters if r["gene_symbol"] in marker_symbols]
@@ -171,34 +219,64 @@ def main() -> None:
 
     audit_path = args.output_dir / "marker_gene_region_audit.tsv"
     with audit_path.open("w", newline="") as handle:
-        fields = ["gene_symbol", "marker_cell_type", "matched_loci", "status"]
+        fields = [
+            "gene_symbol",
+            "marker_cell_type",
+            "promoter_loci",
+            "gene_body_loci",
+            "status",
+        ]
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
         writer.writeheader()
         for row in marker_rows:
             symbol = row["gene_symbol"]
-            n_loci = len(symbol_loci.get(symbol, set()))
+            promoter_loci = len(promoter_symbol_loci.get(symbol, set()))
+            body_loci = len(body_symbol_loci.get(symbol, set()))
+            if promoter_loci and body_loci:
+                status = "complete"
+            elif promoter_loci:
+                status = "promoter_only"
+            elif body_loci:
+                status = "gene_body_only"
+            else:
+                status = "unmatched"
+            if promoter_loci > 1 or body_loci > 1:
+                status += "_ambiguous"
             writer.writerow(
                 {
                     "gene_symbol": symbol,
                     "marker_cell_type": row["marker_cell_type"],
-                    "matched_loci": n_loci,
-                    "status": "unmatched" if n_loci == 0 else "unique" if n_loci == 1 else "ambiguous",
+                    "promoter_loci": promoter_loci,
+                    "gene_body_loci": body_loci,
+                    "status": status,
                 }
             )
 
-    status_counts = Counter(
-        "unmatched" if not symbol_loci.get(s) else "unique" if len(symbol_loci[s]) == 1 else "ambiguous"
-        for s in marker_symbols
-    )
+    def marker_status(symbol: str) -> str:
+        promoter_loci = len(promoter_symbol_loci.get(symbol, set()))
+        body_loci = len(body_symbol_loci.get(symbol, set()))
+        if promoter_loci and body_loci:
+            status = "complete"
+        elif promoter_loci:
+            status = "promoter_only"
+        elif body_loci:
+            status = "gene_body_only"
+        else:
+            status = "unmatched"
+        return status + "_ambiguous" if promoter_loci > 1 or body_loci > 1 else status
+
+    status_counts = Counter(marker_status(symbol) for symbol in marker_symbols)
     summary = {
-        "assembly": "GRCh38/hg38 (from configured GENCODE v44 GTF)",
+        "assembly": "GRCh38/hg38",
         "gtf": str(args.gtf),
+        "promoter_bed": str(args.promoter_bed),
         "primary_gene_records": len(genes),
+        "primary_promoter_records": len(promoters),
+        "promoter_input_audit": promoter_audit,
         "marker_genes": len(marker_symbols),
         "marker_status": dict(status_counts),
-        "promoter_upstream_bp": args.promoter_upstream,
-        "promoter_downstream_bp": args.promoter_downstream,
-        "promoter_coordinate_rule": "strand-aware BED half-open interval",
+        "promoter_definition": PROMOTER_DEFINITION,
+        "promoter_coordinate_rule": "use external BED coordinates as BED half-open intervals",
     }
     (args.output_dir / "region_summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n"

@@ -27,6 +27,11 @@ GENCODE_GTF = Path(
         "GENCODE_GTF", "/share/LCZX_Data/ref/gencode.v44.basic.annotation.gtf"
     )
 )
+PROMOTER_BED = Path(
+    os.environ.get(
+        "PROMOTER_BED", PROJECT_ROOT / "gencode.promoter_2kb.symbol.bed"
+    )
+)
 
 QC_TAG = "qc_minmeth55_maxmethnone_maxsites10000000_covdedupprob"
 THRESHOLD = "300k"
@@ -59,8 +64,7 @@ PREFERRED_CELL_TYPE_ORDER = (
 )
 EXCLUDED_CELL_TYPES = frozenset({"Platelet_erythroid_contamination"})
 
-PROMOTER_UPSTREAM_BP = 2000
-PROMOTER_DOWNSTREAM_BP = 500
+PROMOTER_DEFINITION = "external GENCODE promoter BED; TSS +/- 2000 bp"
 MARKER_ADJUSTED_P_MAX = 0.05
 MARKER_LOG2FC_MIN = 0.25
 MARKER_EXPRESSION_FRACTION_MIN = 0.10

@@ -16,6 +16,7 @@
 - RNA表达：`adata.raw.X`（完整基因、log-normalized）
 - RNA cell type：`cell_type_integrated`
 - hg38：`/share/LCZX_Data/ref/gencode.v44.basic.annotation.gtf`（GENCODE v44）
+- promoter：`/share/home/rzli/METHSCAN/03_MethExprBubble/gencode.promoter_2kb.symbol.bed`（TSS ±2 kb）
 - 甲基化：每个样本自己的300k Top200 DMR mean-ratio matrix
 - cov：每个样本自己的`cov_dedup_probability`
 
@@ -47,7 +48,7 @@ effective_weight = unique_CpG_count(cell, DMR) × overlap_bp / DMR_length
 region_probability = Σ(DMR_probability × effective_weight) / Σ(effective_weight)
 ```
 
-Promoter固定为链特异的`TSS -2000 bp / +500 bp`；gene body使用GENCODE gene feature完整区间。DMR可同时属于promoter和gene body，也可对应多个基因。
+Promoter直接使用外部GENCODE BED中的`TSS ±2000 bp`；gene body使用GENCODE gene feature完整区间。输入promoter BED的非主染色体记录会被排除。DMR可同时属于promoter和gene body，也可对应多个基因。
 
 甲基化汇总要求至少10个有效细胞且有效比例至少20%；否则均值保留为`NA`。`NA`不补0。
 
