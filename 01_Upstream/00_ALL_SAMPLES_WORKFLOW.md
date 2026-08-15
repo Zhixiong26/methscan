@@ -37,7 +37,7 @@
 ## 运行顺序
 
 ```bash
-cd /share/home/rzli/METHSCAN/01_Upstream
+cd /share/home/rzli/METHSCAN/20260815/01_Upstream
 
 bash 01_check_cov_duplicates.sh all 2 48
 bash 02_deduplicate_cov_by_probability.sh all 2 48
