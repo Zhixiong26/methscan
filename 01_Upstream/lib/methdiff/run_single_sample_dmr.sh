@@ -11,31 +11,24 @@
 
 set -uo pipefail
 
-SAMPLE_NAME="${SAMPLE_NAME:-25110891_IR01_Met}"
-if [[ "$SAMPLE_NAME" =~ ^25110891_((IR|NR)[0-9]{2})_Met$ ]]; then
-    DERIVED_SAMPLE_SHORT="${BASH_REMATCH[1]}"
-else
-    echo "ERROR: unsupported sample name: $SAMPLE_NAME" >&2
-    exit 1
-fi
-SAMPLE_SHORT="${SAMPLE_SHORT:-$DERIVED_SAMPLE_SHORT}"
-[[ "$SAMPLE_SHORT" == "$DERIVED_SAMPLE_SHORT" ]] || {
-    echo "ERROR: SAMPLE_SHORT=$SAMPLE_SHORT does not match SAMPLE_NAME=$SAMPLE_NAME" >&2
-    exit 1
-}
-SAMPLE_DIR="/share/LCZX_Data/data/allcools/${SAMPLE_NAME}"
-QC_TAG="minmeth55_maxmethnone_maxsites1200000_scanpy0814clean_covdedupprob"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 THRESHOLD="${THRESHOLD:-30k}"
+source "$SCRIPT_DIR/../workflow_common.sh"
+
+SAMPLE_NAME="${SAMPLE_NAME:-25110891_IR01_Met}"
+DERIVED_SAMPLE_SHORT="$(sample_short "$SAMPLE_NAME")" ||
+    die "unsupported sample name: $SAMPLE_NAME"
+SAMPLE_SHORT="${SAMPLE_SHORT:-$DERIVED_SAMPLE_SHORT}"
+[[ "$SAMPLE_SHORT" == "$DERIVED_SAMPLE_SHORT" ]] ||
+    die "SAMPLE_SHORT=$SAMPLE_SHORT does not match SAMPLE_NAME=$SAMPLE_NAME"
+SAMPLE_DIR="$BASE_DIR/$SAMPLE_NAME"
 QC_ROOT="${SAMPLE_DIR}/qc_${QC_TAG}"
 DATA_DIR="${DATA_DIR:-${QC_ROOT}/filtered_data_single_${THRESHOLD}}"
 UPSTREAM_LOG_DIR="${QC_ROOT}/logs_single_${THRESHOLD}"
 SMOOTH_OK="${UPSTREAM_LOG_DIR}/smooth.ok"
 FILTER_PROVENANCE="${DATA_DIR}/filter_provenance.tsv"
 
-ANNOTATION_CSV="${ANNOTATION_CSV:-/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_all_cells.csv}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${QC_ROOT}/methdiff_celltype_${THRESHOLD}}"
-CONDA_INIT="${CONDA_INIT:-/share/home/rzli/miniconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-scDNAm}"
 PYTHON_NUM_THREADS="${PYTHON_NUM_THREADS:-1}"
 
 MIN_CELLS="${MIN_CELLS:-10}"
@@ -78,15 +71,6 @@ Examples:
   SAMPLE_NAME=25110891_IR01_Met THRESHOLD=300k bash run_single_sample_dmr.sh run 1 24
   SAMPLE_NAME=25110891_IR01_Met THRESHOLD=300k bash run_single_sample_dmr.sh status
 EOF
-}
-
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
-
-is_positive_integer() {
-    [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
 run_python() {
@@ -264,9 +248,7 @@ initialize_compute_environment() {
     [[ "$THRESHOLD" == 30k || "$THRESHOLD" == 300k ]] ||
         die "this single-sample script currently supports THRESHOLD=30k or 300k"
 
-    [[ -s "$CONDA_INIT" ]] || die "Conda initialization missing: $CONDA_INIT"
-    source "$CONDA_INIT" || die "failed to initialize Conda"
-    conda activate "$CONDA_ENV" || die "failed to activate Conda env: $CONDA_ENV"
+    activate_conda
     command -v methscan >/dev/null 2>&1 || die "methscan is unavailable"
     command -v python >/dev/null 2>&1 || die "python is unavailable"
     command -v sha256sum >/dev/null 2>&1 || die "sha256sum is unavailable"

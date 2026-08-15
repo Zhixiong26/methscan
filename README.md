@@ -1,12 +1,10 @@
-# METHSCAN 当前工作区
+# METHSCAN 20260815 工作流
 
-根目录只保留2026-08最近运行成功的单样本MethSCAn流程：
+本仓库只保留2026-08已验证的10样本独立MethSCAn流程：
 
 ```text
-01_Upstream/   正式01–09调度入口、内置DMR实现、文档和当前热图结果
-archive_local/ 未在本轮成功流程中使用的旧版或待验证内容
+01_Upstream/       01–09正式入口、分析实现与运行文档
+01_Upstream/lib/   公共配置、单样本实现与核心Python计算模块
 ```
 
 主入口是[`01_Upstream/00_ALL_SAMPLES_WORKFLOW.md`](01_Upstream/00_ALL_SAMPLES_WORKFLOW.md)。
-
-`archive_local/`内容未删除；如后续需要恢复某个下游模块，应先单独验证再移回正式顶层。

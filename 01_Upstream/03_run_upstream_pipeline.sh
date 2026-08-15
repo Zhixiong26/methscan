@@ -1,67 +1,36 @@
 #!/usr/bin/env bash
 
-# ==============================================================================
-# Methscan 全样本上游流程：状态检查、阈值分析与断点续跑
-#
-# 运行逻辑序号：
-#   [1/8] Preflight：环境、参数、QC 配置与既有完成状态检查
-#   [2/8] Prepare：cov -> compact（阈值无关，可复用）
-#   [3/8] Profile：TSS QC（阈值无关，按 TSS SHA-256 复用）
-#   [4/8] Filter：按 min/max sites 和 min-meth 过滤细胞
-#   [5/8] Smooth：对 filtered 数据进行伪 bulk 平滑
-#   [6/8] Scan：发现 VMR
-#   [7/8] Matrix：生成细胞 × VMR 矩阵
-#   [8/8] Summary：汇总每个样本成功/失败状态
-# 说明：prepare/profile 与过滤阈值无关，优先复用已有合格产物。
-#
-# 用法：
-#   bash 03_run_upstream_pipeline.sh status [10k|20k|30k|50k|300k]
-#   bash 03_run_upstream_pipeline.sh run <threshold> [max_jobs] [threads] [sample|all]
-#   bash 03_run_upstream_pipeline.sh run-to-compact <threshold> [max_jobs] [threads] [sample|all]
-#   bash 03_run_upstream_pipeline.sh run-to-smooth <threshold> [max_jobs] [threads] [sample|all]
-# ==============================================================================
+# MethSCAn upstream workflow for ten independent samples:
+# prepare -> profile -> coverage filter -> Scanpy clean-cell filter ->
+# smooth -> scan -> matrix.
 
 set -uo pipefail
 
-# ==============================================================================
-# 1. 全局配置
-#    所有配置均可在命令前通过同名环境变量覆盖。
-# ==============================================================================
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="${BASE_DIR:-/share/LCZX_Data/data/allcools}"
+source "$SCRIPT_DIR/lib/workflow_common.sh"
+
 DATA_TAG="${DATA_TAG:-covdedupprob}"
 COV_SUBDIR="${COV_SUBDIR:-cov_dedup_probability}"
 COMPACT_SUBDIR="${COMPACT_SUBDIR:-compact_data_dedup_probability}"
 PROFILE_BASENAME="${PROFILE_BASENAME:-TSS_profile_dedup_probability}"
 TSS_BED="${TSS_BED:-/share/LCZX_Data/ref/human_hg38_TSS.bed}"
-CONDA_INIT="${CONDA_INIT:-/share/home/rzli/miniconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-scDNAm}"
-EXPECTED_SAMPLES="${EXPECTED_SAMPLES:-10}"
 DEFAULT_MAX_JOBS="${DEFAULT_MAX_JOBS:-1}"
 DEFAULT_THREADS="${DEFAULT_THREADS:-20}"
 FILTER_MIN_METH="${FILTER_MIN_METH:-55}"
 FILTER_MAX_METH="${FILTER_MAX_METH:-}"
 FILTER_MAX_SITES="${FILTER_MAX_SITES:-1200000}"
-SCANPY_CLEAN_CSV="${SCANPY_CLEAN_CSV:-/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_clean_cells.csv}"
 SCANPY_FILTER_LABEL="${SCANPY_FILTER_LABEL:-scanpy0814clean}"
 SCANPY_KEEP_SCRIPT="${SCANPY_KEEP_SCRIPT:-${SCRIPT_DIR}/lib/build_scanpy_clean_cell_list.py}"
 VALID_THRESHOLDS=(10k 20k 30k 50k 300k)
-TSS_SHA256=""
-SCRIPT_SHA256=""
-SCANPY_CLEAN_SHA256=""
-STOP_AFTER_SMOOTH="${STOP_AFTER_SMOOTH:-0}"
-STOP_AFTER_PREPARE="${STOP_AFTER_PREPARE:-0}"
 
 FILTER_MAX_METH_LABEL="${FILTER_MAX_METH:-none}"
 QC_TAG="minmeth${FILTER_MIN_METH}_maxmeth${FILTER_MAX_METH_LABEL}_maxsites${FILTER_MAX_SITES}_${SCANPY_FILTER_LABEL}"
 QC_TAG="${QC_TAG//./p}"
+TSS_SHA256=""
+SCANPY_CLEAN_SHA256=""
+STOP_AFTER_PREPARE="${STOP_AFTER_PREPARE:-0}"
+STOP_AFTER_SMOOTH="${STOP_AFTER_SMOOTH:-0}"
 
-# ==============================================================================
-# 2. 命令行帮助与基础参数校验
-# ==============================================================================
-
-# 打印命令格式和常用示例。
 usage() {
     cat <<'EOF'
 Usage:
@@ -69,285 +38,124 @@ Usage:
   bash 03_run_upstream_pipeline.sh run <threshold> [max_jobs] [threads] [sample|all]
   bash 03_run_upstream_pipeline.sh run-to-compact <threshold> [max_jobs] [threads] [sample|all]
   bash 03_run_upstream_pipeline.sh run-to-smooth <threshold> [max_jobs] [threads] [sample|all]
-
-Examples:
-  bash 03_run_upstream_pipeline.sh status
-  bash 03_run_upstream_pipeline.sh status 30k
-  bash 03_run_upstream_pipeline.sh run-to-compact 300k 10 1 all
-  bash 03_run_upstream_pipeline.sh run-to-smooth 300k 10 1 all
 EOF
 }
 
-# 打印错误并终止主进程。
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
-
-# 判断阈值是否属于允许的五档阈值。
 is_threshold() {
-    local value="$1"
     local item
     for item in "${VALID_THRESHOLDS[@]}"; do
-        [[ "$value" == "$item" ]] && return 0
+        [[ "$1" == "$item" ]] && return 0
     done
     return 1
 }
 
-# 并发数和线程数必须是正整数。
-is_positive_integer() {
-    [[ "$1" =~ ^[1-9][0-9]*$ ]]
-}
-
-# 甲基化阈值使用 0–100 的百分数；空字符串仅允许表示“不设上限”。
-is_percentage() {
-    local value="$1"
-    [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
-        awk -v value="$value" 'BEGIN { exit(value >= 0 && value <= 100 ? 0 : 1) }'
-}
-
-# 校验过滤配置，防止异常环境变量生成错误路径或传给 MethSCAn。
-validate_filter_config() {
-    is_percentage "$FILTER_MIN_METH" ||
-        die "FILTER_MIN_METH must be a percentage between 0 and 100"
+validate_config() {
+    local percentage='^[0-9]+([.][0-9]+)?$'
+    [[ "$FILTER_MIN_METH" =~ $percentage ]] &&
+        awk -v x="$FILTER_MIN_METH" 'BEGIN { exit(x >= 0 && x <= 100 ? 0 : 1) }' ||
+        die "FILTER_MIN_METH must be between 0 and 100"
     if [[ -n "$FILTER_MAX_METH" ]]; then
-        is_percentage "$FILTER_MAX_METH" ||
-            die "FILTER_MAX_METH must be empty or a percentage between 0 and 100"
-        awk -v min="$FILTER_MIN_METH" -v max="$FILTER_MAX_METH" \
-            'BEGIN { exit(max >= min ? 0 : 1) }' ||
-            die "FILTER_MAX_METH must be greater than or equal to FILTER_MIN_METH"
+        [[ "$FILTER_MAX_METH" =~ $percentage ]] &&
+            awk -v min="$FILTER_MIN_METH" -v max="$FILTER_MAX_METH" \
+                'BEGIN { exit(max >= min && max <= 100 ? 0 : 1) }' ||
+            die "FILTER_MAX_METH must be between FILTER_MIN_METH and 100"
     fi
-    is_positive_integer "$FILTER_MAX_SITES" ||
-        die "FILTER_MAX_SITES must be a positive integer"
-    [[ "$FILTER_MAX_SITES" -ge 300000 ]] ||
-        die "FILTER_MAX_SITES must be at least the largest min-sites threshold (300000)"
+    is_positive_integer "$FILTER_MAX_SITES" || die "FILTER_MAX_SITES must be positive"
+    [[ "$FILTER_MAX_SITES" -ge 300000 ]] || die "FILTER_MAX_SITES must be at least 300000"
     [[ "$SCANPY_FILTER_LABEL" =~ ^[A-Za-z0-9._-]+$ ]] ||
-        die "SCANPY_FILTER_LABEL contains unsupported characters"
-    [[ "$QC_TAG" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid derived QC tag: $QC_TAG"
+        die "invalid SCANPY_FILTER_LABEL"
 }
 
-# 计算 clean-cell 注释文件哈希，使同一路径内容更新后不能误用旧产物。
-initialize_scanpy_provenance() {
-    [[ -s "$SCANPY_CLEAN_CSV" ]] ||
-        die "Scanpy clean-cell annotation missing: $SCANPY_CLEAN_CSV"
-    [[ -s "$SCANPY_KEEP_SCRIPT" ]] ||
-        die "Scanpy keep-list helper missing: $SCANPY_KEEP_SCRIPT"
-    command -v sha256sum >/dev/null 2>&1 ||
-        die "sha256sum is required for Scanpy annotation provenance checks"
+initialize_provenance() {
+    [[ -s "$SCANPY_CLEAN_CSV" ]] || die "Scanpy clean-cell annotation missing: $SCANPY_CLEAN_CSV"
+    [[ -s "$SCANPY_KEEP_SCRIPT" ]] || die "Scanpy keep-list helper missing: $SCANPY_KEEP_SCRIPT"
     SCANPY_CLEAN_SHA256="$(sha256sum "$SCANPY_CLEAN_CSV" | awk '{print $1}')"
-    [[ "$SCANPY_CLEAN_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
-        die "failed to calculate Scanpy clean-cell annotation SHA-256"
 }
 
-# ==============================================================================
-# 3. 产物计数与完整性判定
-#    不以“目录或日志存在”作为成功标准，检查关键非空文件。
-# ==============================================================================
-
-# 统计目录第一层中匹配给定模式的普通文件。
-count_files() {
-    local dir="$1"
-    local pattern="${2:-*}"
-    find "$dir" -maxdepth 1 -type f -name "$pattern" 2>/dev/null | wc -l
-}
-
-# 统计数据目录中的真实细胞数；每行对应一个细胞。
 count_cells() {
-    local dir="$1"
-    local header="$dir/column_header.txt"
-
-    if [[ ! -s "$header" ]]; then
-        printf '0\n'
-        return 0
-    fi
-    awk 'NF { n += 1 } END { print n + 0 }' "$header"
+    [[ -s "$1/column_header.txt" ]] || { printf '0\n'; return; }
+    awk 'NF { n++ } END { print n + 0 }' "$1/column_header.txt"
 }
 
-# compact 必须包含细胞名、细胞统计信息和至少一个染色体 NPZ。
+count_files() {
+    find "$1" -maxdepth 1 -type f -name "${2:-*}" 2>/dev/null | wc -l
+}
+
 valid_compact() {
-    local dir="$1"
-    [[ -s "$dir/column_header.txt" ]] &&
-        [[ -s "$dir/cell_stats.csv" ]] &&
-        find "$dir" -maxdepth 1 -type f -name '*.npz' -print -quit 2>/dev/null |
-        grep -q .
+    [[ -s "$1/column_header.txt" && -s "$1/cell_stats.csv" ]] &&
+        find "$1" -maxdepth 1 -type f -name '*.npz' -print -quit 2>/dev/null | grep -q .
 }
 
-# 检查 coverage-filtered 数据是否由当前覆盖度与甲基化阈值生成。
-valid_coverage_filter_provenance() {
-    local dir="$1"
-    local min_sites="$2"
-    local metadata="$dir/filter_provenance.tsv"
-
-    [[ -s "$metadata" ]] &&
-        awk -F '\t' \
-            -v min_sites="$min_sites" \
-            -v max_sites="$FILTER_MAX_SITES" \
-            -v min_meth="$FILTER_MIN_METH" \
-            -v max_meth="$FILTER_MAX_METH_LABEL" '
-            $1 == "min_sites" && $2 == min_sites { a = 1 }
-            $1 == "max_sites" && $2 == max_sites { b = 1 }
-            $1 == "min_meth" && $2 == min_meth { c = 1 }
-            $1 == "max_meth" && $2 == max_meth { d = 1 }
-            END { exit(a && b && c && d ? 0 : 1) }
-        ' "$metadata"
+metadata_matches() {
+    local file="$1"
+    shift
+    local item
+    [[ -s "$file" ]] || return 1
+    for item in "$@"; do
+        grep -Fxq "$item" "$file" || return 1
+    done
 }
 
-# coverage-filtered 目录结构与 compact 相同。
 valid_coverage_filtered() {
-    local dir="$1"
-    local min_sites="$2"
-    valid_compact "$dir" &&
-        [[ "$(count_cells "$dir")" -gt 0 ]] &&
-        valid_coverage_filter_provenance "$dir" "$min_sites"
+    local dir="$1" min_sites="$2"
+    valid_compact "$dir" && metadata_matches "$dir/filter_provenance.tsv" \
+        $'min_sites\t'"$min_sites" \
+        $'max_sites\t'"$FILTER_MAX_SITES" \
+        $'min_meth\t'"$FILTER_MIN_METH" \
+        $'max_meth\t'"$FILTER_MAX_METH_LABEL"
 }
 
-# 最终 filtered 数据还必须匹配当前 Scanpy clean-cell 注释及其 SHA-256。
-valid_filter_provenance() {
-    local dir="$1"
-    local min_sites="$2"
-    local metadata="$dir/filter_provenance.tsv"
-
-    valid_coverage_filter_provenance "$dir" "$min_sites" &&
-        awk -F '\t' \
-            -v annotation="$SCANPY_CLEAN_CSV" \
-            -v annotation_sha="$SCANPY_CLEAN_SHA256" \
-            -v label="$SCANPY_FILTER_LABEL" '
-            $1 == "scanpy_clean_csv" && $2 == annotation { a = 1 }
-            $1 == "scanpy_clean_sha256" && $2 == annotation_sha { b = 1 }
-            $1 == "scanpy_filter_label" && $2 == label { c = 1 }
-            END { exit(a && b && c ? 0 : 1) }
-        ' "$metadata"
-}
-
-# 最终 filtered 目录只包含同时通过 coverage 与 Scanpy clean-cell 筛选的细胞。
 valid_filtered() {
-    local dir="$1"
-    local min_sites="$2"
-    valid_compact "$dir" &&
-        [[ "$(count_cells "$dir")" -gt 0 ]] &&
-        valid_filter_provenance "$dir" "$min_sites"
+    local dir="$1" min_sites="$2"
+    valid_coverage_filtered "$dir" "$min_sites" &&
+        metadata_matches "$dir/filter_provenance.tsv" \
+            $'scanpy_clean_csv\t'"$SCANPY_CLEAN_CSV" \
+            $'scanpy_clean_sha256\t'"$SCANPY_CLEAN_SHA256" \
+            $'scanpy_filter_label\t'"$SCANPY_FILTER_LABEL"
 }
 
-# smooth 会在 filtered 目录下创建非空 smoothed 子目录。
 valid_smooth() {
-    local dir="$1"
-    [[ -d "$dir/smoothed" ]] &&
-        [[ -n "$(find "$dir/smoothed" -mindepth 1 -print -quit 2>/dev/null)" ]]
+    [[ -n "$(find "$1/smoothed" -mindepth 1 -print -quit 2>/dev/null)" ]]
 }
 
-# scan 必须产生非空 VMRs.bed。
 valid_scan() {
     [[ -s "$1/VMRs.bed" ]]
 }
 
-# matrix 必须包含非空 total_sites.csv.gz，且目录至少有 4 个文件。
 valid_matrix() {
-    local dir="$1"
-    [[ -s "$dir/total_sites.csv.gz" ]] &&
-        [[ "$(count_files "$dir")" -ge 4 ]]
+    [[ -s "$1/total_sites.csv.gz" && "$(count_files "$1")" -ge 4 ]]
 }
 
-# ==============================================================================
-# 4. 样本发现与阈值无关产物复用
-# ==============================================================================
-
-# 收集并排序所有 *_Met 样本；样本数异常时立即停止。
-collect_samples() {
-    mapfile -t SAMPLE_DIRS < <(
-        find "$BASE_DIR" -maxdepth 1 -type d -name '*_Met' | sort
-    )
-    [[ "${#SAMPLE_DIRS[@]}" -eq "$EXPECTED_SAMPLES" ]] ||
-        die "found ${#SAMPLE_DIRS[@]} sample directories; expected ${EXPECTED_SAMPLES}"
-}
-
-# 所有样本的概率去重数据使用独立 QC 根目录。
 qc_root_for_sample() {
-    local sample_dir="$1"
-    printf '%s/qc_%s_%s\n' "$sample_dir" "$QC_TAG" "$DATA_TAG"
+    printf '%s/qc_%s_%s\n' "$1" "$QC_TAG" "$DATA_TAG"
 }
 
-# 只允许复用由概率去重 cov 生成的 compact，避免混入原始 cov 产物。
-choose_compact() {
-    local sample_dir="$1"
-    local candidate="$sample_dir/$COMPACT_SUBDIR"
-    if valid_compact "$candidate"; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
-    return 1
-}
-
-# 判断 common profile 是否由当前 TSS_BED 生成。
 valid_profile() {
-    local sample_dir="$1"
-    local compact_dir="$2"
-    local profile_file="$sample_dir/${PROFILE_BASENAME}.csv"
-    local metadata_file="$sample_dir/${PROFILE_BASENAME}.meta.tsv"
-
-    [[ -s "$profile_file" ]] &&
-        [[ -s "$metadata_file" ]] &&
-        awk -F '\t' -v expected="$TSS_SHA256" -v compact="$compact_dir" '
-            $1 == "tss_sha256" && $2 == expected { tss_matched = 1 }
-            $1 == "input_compact" && $2 == compact { compact_matched = 1 }
-            END { exit(tss_matched && compact_matched ? 0 : 1) }
-        ' "$metadata_file"
+    metadata_matches "$1/${PROFILE_BASENAME}.meta.tsv" \
+        $'tss_sha256\t'"$TSS_SHA256" $'input_compact\t'"$2" &&
+        [[ -s "$1/${PROFILE_BASENAME}.csv" ]]
 }
 
-# 仅复用带有匹配 SHA-256 元数据的 common profile。
-# 不再自动采用来源不明的 TSS_profile_single_*.csv。
-choose_profile() {
-    local sample_dir="$1"
-    local compact_dir="$2"
-    if valid_profile "$sample_dir" "$compact_dir"; then
-        printf '%s/%s.csv\n' "$sample_dir" "$PROFILE_BASENAME"
-        return 0
-    fi
-    return 1
-}
-
-# 判断 QC 根目录是否与本次过滤配置一致。
 valid_qc_config() {
-    local qc_root="$1"
-    local metadata="$qc_root/pipeline_config.tsv"
-
-    [[ -s "$metadata" ]] &&
-        awk -F '\t' \
-            -v qc_tag="$QC_TAG" \
-            -v max_sites="$FILTER_MAX_SITES" \
-            -v min_meth="$FILTER_MIN_METH" \
-            -v max_meth="$FILTER_MAX_METH_LABEL" \
-            -v annotation="$SCANPY_CLEAN_CSV" \
-            -v annotation_sha="$SCANPY_CLEAN_SHA256" \
-            -v scanpy_label="$SCANPY_FILTER_LABEL" '
-            $1 == "qc_tag" && $2 == qc_tag { a = 1 }
-            $1 == "max_sites" && $2 == max_sites { b = 1 }
-            $1 == "min_meth" && $2 == min_meth { c = 1 }
-            $1 == "max_meth" && $2 == max_meth { d = 1 }
-            $1 == "scanpy_clean_csv" && $2 == annotation { e = 1 }
-            $1 == "scanpy_clean_sha256" && $2 == annotation_sha { f = 1 }
-            $1 == "scanpy_filter_label" && $2 == scanpy_label { g = 1 }
-            END { exit(a && b && c && d && e && f && g ? 0 : 1) }
-        ' "$metadata"
+    metadata_matches "$1/pipeline_config.tsv" \
+        $'qc_tag\t'"$QC_TAG" \
+        $'max_sites\t'"$FILTER_MAX_SITES" \
+        $'min_meth\t'"$FILTER_MIN_METH" \
+        $'max_meth\t'"$FILTER_MAX_METH_LABEL" \
+        $'scanpy_clean_csv\t'"$SCANPY_CLEAN_CSV" \
+        $'scanpy_clean_sha256\t'"$SCANPY_CLEAN_SHA256" \
+        $'scanpy_filter_label\t'"$SCANPY_FILTER_LABEL"
 }
 
-# 首次运行时创建 QC 配置；已有内容但配置不匹配时拒绝继续。
 ensure_qc_config() {
-    local qc_root="$1"
-    local metadata="$qc_root/pipeline_config.tsv"
-    local tmp="${metadata}.tmp.$$"
-
-    if valid_qc_config "$qc_root"; then
-        return 0
-    fi
-    if [[ -d "$qc_root" ]] &&
-        [[ -n "$(find "$qc_root" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-        echo "ERROR: QC directory exists without matching configuration: $qc_root" >&2
-        echo "       Archive it or use the parameters recorded in pipeline_config.tsv." >&2
+    local root="$1" file="$1/pipeline_config.tsv"
+    valid_qc_config "$root" && return 0
+    [[ ! -d "$root" || -z "$(find "$root" -mindepth 1 -print -quit 2>/dev/null)" ]] || {
+        echo "ERROR: QC directory has a different or missing configuration: $root" >&2
         return 1
-    fi
-
-    mkdir -p "$qc_root"
-    if ! {
+    }
+    mkdir -p "$root"
+    {
         printf 'qc_tag\t%s\n' "$QC_TAG"
         printf 'max_sites\t%s\n' "$FILTER_MAX_SITES"
         printf 'min_meth\t%s\n' "$FILTER_MIN_METH"
@@ -355,175 +163,81 @@ ensure_qc_config() {
         printf 'scanpy_clean_csv\t%s\n' "$SCANPY_CLEAN_CSV"
         printf 'scanpy_clean_sha256\t%s\n' "$SCANPY_CLEAN_SHA256"
         printf 'scanpy_filter_label\t%s\n' "$SCANPY_FILTER_LABEL"
-        printf 'script_sha256\t%s\n' "$SCRIPT_SHA256"
+        printf 'script_sha256\t%s\n' "$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')"
         printf 'created_at\t%s\n' "$(date -Is)"
-    } >"$tmp"; then
-        rm -f "$tmp"
-        echo "ERROR: failed to write QC configuration: $metadata" >&2
-        return 1
-    fi
-    mv "$tmp" "$metadata"
+    } >"$file"
 }
 
-# 记录第一阶段 coverage 过滤的阈值、输入目录和过滤前后细胞数。
-write_coverage_filter_provenance() {
-    local filtered_dir="$1"
-    local compact_dir="$2"
-    local min_sites="$3"
-    local metadata="$filtered_dir/filter_provenance.tsv"
-    local tmp="${metadata}.tmp.$$"
-
-    if ! {
+write_filter_provenance() {
+    local output="$1" compact="$2" min_sites="$3" coverage="${4:-}" keep_file="${5:-}"
+    local file="$output/filter_provenance.tsv"
+    {
         printf 'qc_tag\t%s\n' "$QC_TAG"
         printf 'min_sites\t%s\n' "$min_sites"
         printf 'max_sites\t%s\n' "$FILTER_MAX_SITES"
         printf 'min_meth\t%s\n' "$FILTER_MIN_METH"
         printf 'max_meth\t%s\n' "$FILTER_MAX_METH_LABEL"
-        printf 'input_compact\t%s\n' "$compact_dir"
-        printf 'cells_before\t%s\n' "$(count_cells "$compact_dir")"
-        printf 'cells_after\t%s\n' "$(count_cells "$filtered_dir")"
+        printf 'input_compact\t%s\n' "$compact"
+        if [[ -n "$coverage" ]]; then
+            printf 'coverage_filtered_dir\t%s\n' "$coverage"
+            printf 'scanpy_clean_csv\t%s\n' "$SCANPY_CLEAN_CSV"
+            printf 'scanpy_clean_sha256\t%s\n' "$SCANPY_CLEAN_SHA256"
+            printf 'scanpy_filter_label\t%s\n' "$SCANPY_FILTER_LABEL"
+            printf 'scanpy_keep_file\t%s\n' "$keep_file"
+            printf 'scanpy_keep_sha256\t%s\n' "$(sha256sum "$keep_file" | awk '{print $1}')"
+            printf 'cells_before\t%s\n' "$(count_cells "$compact")"
+            printf 'cells_after_coverage\t%s\n' "$(count_cells "$coverage")"
+        else
+            printf 'cells_before\t%s\n' "$(count_cells "$compact")"
+        fi
+        printf 'cells_after\t%s\n' "$(count_cells "$output")"
         printf 'created_at\t%s\n' "$(date -Is)"
-    } >"$tmp"; then
-        rm -f "$tmp"
-        echo "ERROR: failed to write filter provenance: $metadata" >&2
+    } >"$file"
+}
+
+require_empty() {
+    [[ ! -d "$1" || -z "$(find "$1" -mindepth 1 -print -quit 2>/dev/null)" ]] || {
+        echo "ERROR: partial $2 output exists; archive it before rerunning: $1" >&2
         return 1
-    fi
-    mv "$tmp" "$metadata"
-}
-
-# 记录第二阶段 Scanpy clean-cell 过滤及其可复现来源。
-write_scanpy_filter_provenance() {
-    local filtered_dir="$1"
-    local coverage_dir="$2"
-    local compact_dir="$3"
-    local min_sites="$4"
-    local keep_file="$5"
-    local metadata="$filtered_dir/filter_provenance.tsv"
-    local tmp="${metadata}.tmp.$$"
-    local keep_sha256
-
-    keep_sha256="$(sha256sum "$keep_file" | awk '{print $1}')" || return 1
-    [[ "$keep_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
-
-    if ! {
-        printf 'qc_tag\t%s\n' "$QC_TAG"
-        printf 'min_sites\t%s\n' "$min_sites"
-        printf 'max_sites\t%s\n' "$FILTER_MAX_SITES"
-        printf 'min_meth\t%s\n' "$FILTER_MIN_METH"
-        printf 'max_meth\t%s\n' "$FILTER_MAX_METH_LABEL"
-        printf 'input_compact\t%s\n' "$compact_dir"
-        printf 'coverage_filtered_dir\t%s\n' "$coverage_dir"
-        printf 'scanpy_clean_csv\t%s\n' "$SCANPY_CLEAN_CSV"
-        printf 'scanpy_clean_sha256\t%s\n' "$SCANPY_CLEAN_SHA256"
-        printf 'scanpy_filter_label\t%s\n' "$SCANPY_FILTER_LABEL"
-        printf 'scanpy_keep_file\t%s\n' "$keep_file"
-        printf 'scanpy_keep_sha256\t%s\n' "$keep_sha256"
-        printf 'cells_before\t%s\n' "$(count_cells "$compact_dir")"
-        printf 'cells_after_coverage\t%s\n' "$(count_cells "$coverage_dir")"
-        printf 'cells_after\t%s\n' "$(count_cells "$filtered_dir")"
-        printf 'created_at\t%s\n' "$(date -Is)"
-    } >"$tmp"; then
-        rm -f "$tmp"
-        echo "ERROR: failed to write Scanpy filter provenance: $metadata" >&2
-        return 1
-    fi
-    mv "$tmp" "$metadata"
-}
-
-# ==============================================================================
-# 5. 日志管理与状态盘点
-# ==============================================================================
-
-# 新一轮运行前保留旧日志，并追加时间戳，避免覆盖诊断证据。
-rotate_log() {
-    local log="$1"
-    if [[ -e "$log" ]]; then
-        mv "$log" "${log}.previous.$(date +%Y%m%d_%H%M%S)"
-    fi
-}
-
-# 执行单个 Methscan 步骤：记录日志、检查退出码、成功后写入 .ok 标记。
-stage_number() {
-    case "$1" in
-        prepare) printf '2' ;;
-        profile) printf '3' ;;
-        filter|coverage_filter|scanpy_keep|scanpy_filter) printf '4' ;;
-        smooth) printf '5' ;;
-        scan) printf '6' ;;
-        matrix) printf '7' ;;
-        *) printf '?' ;;
-    esac
+    }
 }
 
 run_logged() {
-    local step="$1"
-    local log="$2"
-    local ok_file="$3"
-    local sequence
+    local step="$1" log="$2" marker="$3"
     shift 3
-
-    sequence="$(stage_number "$step")"
-
-    rotate_log "$log"
-    rm -f "$ok_file"
-    echo "    [$sequence/8 RUN] $step"
-
+    [[ ! -e "$log" ]] || mv "$log" "${log}.previous.$(date +%Y%m%d_%H%M%S)"
+    rm -f "$marker"
+    echo "    [RUN] $step"
     if "$@" >"$log" 2>&1; then
-        date -Is >"$ok_file"
-        echo "    [$sequence/8 OK]  $step"
-        return 0
+        date -Is >"$marker"
+        echo "    [OK]  $step"
     else
         local rc=$?
-        echo "    [$sequence/8 FAIL] $step (exit $rc); see $log" >&2
+        echo "    [FAIL] $step (exit $rc); see $log" >&2
         return "$rc"
     fi
 }
 
-# 输出一个样本在一个阈值下的产物数量。
 status_one() {
-    local sample_dir="$1"
-    local threshold="$2"
-    local min_sites="${threshold%k}000"
-    local sample="${sample_dir##*/}"
-    local compact=0 filtered=0 vmrs=0 matrix logs
-    local compact_dir
-    local qc_root
-    qc_root="$(qc_root_for_sample "$sample_dir")"
-    local filtered_dir="$qc_root/filtered_data_single_${threshold}"
-    local scan_dir="$qc_root/scan_results_single_${threshold}"
-    local matrix_dir="$qc_root/VMR_matrix_single_${threshold}"
-    local log_dir="$qc_root/logs_single_${threshold}"
-
-    if compact_dir="$(choose_compact "$sample_dir" "$threshold")"; then
-        compact="$(count_cells "$compact_dir")"
-    fi
-    if valid_qc_config "$qc_root"; then
-        if valid_filtered "$filtered_dir" "$min_sites"; then
-            filtered="$(count_cells "$filtered_dir")"
-        fi
-        if valid_scan "$scan_dir"; then
-            vmrs="$(wc -l <"$scan_dir/VMRs.bed")"
-        fi
-        matrix="$(count_files "$matrix_dir")"
-        logs="$(count_files "$log_dir")"
-    else
-        matrix=0
-        logs=0
-    fi
-
+    local sample_dir="$1" threshold="$2" min_sites="${2%k}000"
+    local sample="${sample_dir##*/}" root filtered scan matrix logs compact
+    root="$(qc_root_for_sample "$sample_dir")"
+    compact="$sample_dir/$COMPACT_SUBDIR"
+    filtered="$root/filtered_data_single_${threshold}"
+    scan="$root/scan_results_single_${threshold}"
+    matrix="$root/VMR_matrix_single_${threshold}"
+    logs="$root/logs_single_${threshold}"
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$sample" "$threshold" "$compact" "$filtered" "$vmrs" "$matrix" "$logs"
+        "$sample" "$threshold" \
+        "$(valid_compact "$compact" && count_cells "$compact" || printf 0)" \
+        "$(valid_filtered "$filtered" "$min_sites" && count_cells "$filtered" || printf 0)" \
+        "$(valid_scan "$scan" && wc -l <"$scan/VMRs.bed" || printf 0)" \
+        "$(count_files "$matrix")" "$(count_files "$logs")"
 }
 
-# 输出指定阈值或全部阈值的状态表。
 show_status() {
-    local requested="${1:-}"
-    local sample_dir threshold
-
-    if [[ -n "$requested" ]]; then
-        is_threshold "$requested" || die "invalid threshold: $requested"
-    fi
-
+    local requested="${1:-}" sample_dir threshold
+    [[ -z "$requested" ]] || is_threshold "$requested" || die "invalid threshold: $requested"
     collect_samples
     printf '# qc_tag=%s min_meth=%s max_meth=%s max_sites=%s scanpy_clean_sha256=%s\n' \
         "$QC_TAG" "$FILTER_MIN_METH" "$FILTER_MAX_METH_LABEL" \
@@ -540,412 +254,179 @@ show_status() {
     done
 }
 
-# ==============================================================================
-# 6. 残缺产物保护
-# ==============================================================================
-
-# 此函数仅在产物未通过完整性校验时调用。
-# 无论 .ok 是否存在，只要目录非空就拒绝覆盖并要求先归档。
-refuse_untrusted_partial() {
-    local dir="$1"
-    local ok_file="$2"
-    local label="$3"
-
-    if [[ -d "$dir" ]] &&
-        [[ -n "$(find "$dir" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
-        echo "ERROR: invalid or unverified $label output exists: $dir" >&2
-        if [[ -s "$ok_file" ]]; then
-            echo "       A success marker exists, but the output failed validation." >&2
-        fi
-        echo "       Archive that directory, then rerun this sample." >&2
-        return 1
-    fi
-}
-
-# ==============================================================================
-# 7. 单样本 Methscan 主流程
-#    已存在完整 matrix 时整条跳过；否则逐步运行并验证。
-# ==============================================================================
-
 run_one_sample() {
-    local sample_dir="$1"
-    local threshold="$2"
-    local threads="$3"
-    local min_sites="${threshold%k}000"
-    local sample="${sample_dir##*/}"
-    local sample_short
-    if [[ "$sample" =~ ^25110891_((IR|NR)[0-9]{2})_Met$ ]]; then
-        sample_short="${BASH_REMATCH[1]}"
-    else
-        echo "ERROR: unsupported sample name: $sample" >&2
-        return 1
-    fi
-    local qc_root
-    qc_root="$(qc_root_for_sample "$sample_dir")"
-    local log_dir="$qc_root/logs_single_${threshold}"
-    local coverage_dir="$qc_root/filtered_coverage_single_${threshold}"
-    local filtered_dir="$qc_root/filtered_data_single_${threshold}"
-    local scanpy_keep_file="$log_dir/scanpy_clean_cells.keep.txt"
-    local scan_dir="$qc_root/scan_results_single_${threshold}"
-    local matrix_dir="$qc_root/VMR_matrix_single_${threshold}"
-    local compact_dir profile_file profile_metadata cov_dir
-    local expected_scanpy_cells actual_scanpy_cells
+    local sample_dir="$1" threshold="$2" threads="$3"
+    local min_sites="${threshold%k}000" sample="${sample_dir##*/}" short
+    local root log_dir coverage_dir filtered_dir keep_file scan_dir matrix_dir
+    local compact_dir="$sample_dir/$COMPACT_SUBDIR"
+    local profile="$sample_dir/${PROFILE_BASENAME}.csv"
+    local profile_meta="$sample_dir/${PROFILE_BASENAME}.meta.tsv"
+    local cov_dir="$sample_dir/$COV_SUBDIR"
+    local expected actual
     local -a cov_files filter_args
 
-    # 全部样本固定使用各自的概率去重 cov 目录。
-    cov_dir="$sample_dir/$COV_SUBDIR"
+    short="$(sample_short "$sample")" || return 1
+    root="$(qc_root_for_sample "$sample_dir")"
+    log_dir="$root/logs_single_${threshold}"
+    coverage_dir="$root/filtered_coverage_single_${threshold}"
+    filtered_dir="$root/filtered_data_single_${threshold}"
+    keep_file="$log_dir/scanpy_clean_cells.keep.txt"
+    scan_dir="$root/scan_results_single_${threshold}"
+    matrix_dir="$root/VMR_matrix_single_${threshold}"
 
     echo ">>> $sample $threshold"
-
-    # ---------- [1/8] Preflight：QC 配置与整体完成检查 ----------
-    echo "    [1/8 CHECK] QC configuration and existing outputs"
-    ensure_qc_config "$qc_root" || return 1
-
-    if compact_dir="$(choose_compact "$sample_dir" "$threshold")" &&
-        valid_profile "$sample_dir" "$compact_dir" &&
-        valid_filtered "$filtered_dir" "$min_sites" &&
-        [[ -s "$log_dir/smooth.ok" ]] && valid_smooth "$filtered_dir" &&
-        valid_scan "$scan_dir" &&
-        valid_matrix "$matrix_dir"; then
-        echo "    [2/8 SKIP] prepare/compact already exists"
-        echo "    [3/8 SKIP] profile already exists"
-        echo "    [4/8 SKIP] filter already exists"
-        echo "    [5/8 SKIP] smooth already completed"
-        echo "    [6/8 SKIP] scan already exists"
-        echo "    [7/8 SKIP] matrix already exists"
-        echo "<<< $sample $threshold complete"
-        return 0
-    fi
-
+    ensure_qc_config "$root" || return 1
     mkdir -p "$log_dir"
 
-    # ---------- [2/8] Prepare：优先复用 compact，无合格产物时才生成 ----------
-    if ! compact_dir="$(choose_compact "$sample_dir" "$threshold")"; then
-        compact_dir="$sample_dir/$COMPACT_SUBDIR"
-        refuse_untrusted_partial "$compact_dir" "$log_dir/prepare.ok" prepare || return 1
-
+    if valid_compact "$compact_dir"; then
+        echo "    [2/8 REUSE] prepare/compact: $compact_dir"
+    else
+        require_empty "$compact_dir" prepare || return 1
         shopt -s nullglob
         cov_files=("$cov_dir"/*.cov.gz)
         shopt -u nullglob
-        [[ "${#cov_files[@]}" -gt 0 ]] || {
-            echo "ERROR: no *.cov.gz files for $sample in $cov_dir" >&2
-            return 1
-        }
-
-        echo "    [2/8 INPUT] cov directory: $cov_dir (${#cov_files[@]} files)"
+        [[ "${#cov_files[@]}" -gt 0 ]] || { echo "ERROR: no cov files: $cov_dir" >&2; return 1; }
         mkdir -p "$compact_dir"
         run_logged prepare "$log_dir/prepare.log" "$log_dir/prepare.ok" \
             methscan prepare "${cov_files[@]}" "$compact_dir" || return 1
-        valid_compact "$compact_dir" || {
-            rm -f "$log_dir/prepare.ok"
-            echo "ERROR: prepare exited successfully but compact output is invalid" >&2
-            return 1
-        }
-    else
-        echo "    [2/8 REUSE] prepare/compact: $compact_dir"
+        valid_compact "$compact_dir" || return 1
     fi
 
     if [[ "$STOP_AFTER_PREPARE" == 1 ]]; then
-        echo "    [3/8 STOP] profile not requested"
-        echo "    [4/8 STOP] filter not requested"
-        echo "    [5/8 STOP] smooth not requested"
         echo "<<< $sample compact ready"
         return 0
     fi
 
-    # ---------- [3/8] Profile：优先复用已有 TSS QC ----------
-    if profile_file="$(choose_profile "$sample_dir" "$compact_dir")"; then
-        echo "    [3/8 REUSE] profile: $profile_file"
+    if valid_profile "$sample_dir" "$compact_dir"; then
+        echo "    [3/8 REUSE] profile: $profile"
     else
-        profile_file="$sample_dir/${PROFILE_BASENAME}.csv"
-        profile_metadata="$sample_dir/${PROFILE_BASENAME}.meta.tsv"
-
-        # 旧 common profile 未提供参考文件校验信息，先改名保留再重建。
-        if [[ -e "$profile_file" ]]; then
-            mv "$profile_file" "${profile_file}.previous.$(date +%Y%m%d_%H%M%S)"
-        fi
-        if [[ -e "$profile_metadata" ]]; then
-            mv "$profile_metadata" "${profile_metadata}.previous.$(date +%Y%m%d_%H%M%S)"
-        fi
-
+        [[ ! -e "$profile" ]] || mv "$profile" "${profile}.previous.$(date +%Y%m%d_%H%M%S)"
+        [[ ! -e "$profile_meta" ]] || mv "$profile_meta" "${profile_meta}.previous.$(date +%Y%m%d_%H%M%S)"
         run_logged profile "$log_dir/profile.log" "$log_dir/profile.ok" \
-            methscan profile --strand-column 6 "$TSS_BED" \
-            "$compact_dir" "$profile_file" || return 1
-        [[ -s "$profile_file" ]] || {
-            rm -f "$log_dir/profile.ok"
-            echo "ERROR: profile exited successfully but CSV is empty" >&2
-            return 1
-        }
-
-        if ! {
+            methscan profile --strand-column 6 "$TSS_BED" "$compact_dir" "$profile" || return 1
+        [[ -s "$profile" ]] || return 1
+        {
             printf 'tss_bed\t%s\n' "$TSS_BED"
             printf 'tss_sha256\t%s\n' "$TSS_SHA256"
             printf 'input_compact\t%s\n' "$compact_dir"
             printf 'created_at\t%s\n' "$(date -Is)"
-        } >"${profile_metadata}.tmp.$$"; then
-            rm -f "$log_dir/profile.ok" "${profile_metadata}.tmp.$$"
-            echo "ERROR: failed to write profile provenance metadata" >&2
-            return 1
-        fi
-        if ! mv "${profile_metadata}.tmp.$$" "$profile_metadata"; then
-            rm -f "$log_dir/profile.ok" "${profile_metadata}.tmp.$$"
-            echo "ERROR: failed to finalize profile provenance metadata" >&2
-            return 1
-        fi
+        } >"$profile_meta"
     fi
 
-    # ---------- [4/8a] Coverage filter：应用覆盖度和最低甲基化阈值 ----------
-    if [[ -s "$log_dir/coverage_filter.ok" ]] &&
-        valid_coverage_filtered "$coverage_dir" "$min_sites"; then
-        echo "    [4/8 SKIP] coverage filter"
+    if [[ -s "$log_dir/coverage_filter.ok" ]] && valid_coverage_filtered "$coverage_dir" "$min_sites"; then
+        echo "    [4/8 REUSE] coverage filter"
     else
-        refuse_untrusted_partial \
-            "$coverage_dir" "$log_dir/coverage_filter.ok" coverage_filter || return 1
+        require_empty "$coverage_dir" coverage-filter || return 1
+        filter_args=(--min-sites "$min_sites" --max-sites "$FILTER_MAX_SITES" --min-meth "$FILTER_MIN_METH")
+        [[ -z "$FILTER_MAX_METH" ]] || filter_args+=(--max-meth "$FILTER_MAX_METH")
         mkdir -p "$coverage_dir"
-        filter_args=(
-            --min-sites "$min_sites"
-            --max-sites "$FILTER_MAX_SITES"
-            --min-meth "$FILTER_MIN_METH"
-        )
-        if [[ -n "$FILTER_MAX_METH" ]]; then
-            filter_args+=(--max-meth "$FILTER_MAX_METH")
-        fi
-
-        run_logged coverage_filter \
-            "$log_dir/coverage_filter.log" "$log_dir/coverage_filter.ok" \
-            methscan filter "${filter_args[@]}" \
-            "$compact_dir" "$coverage_dir" || return 1
-        write_coverage_filter_provenance \
-            "$coverage_dir" "$compact_dir" "$min_sites" || {
-            rm -f "$log_dir/coverage_filter.ok"
-            return 1
-        }
-        valid_coverage_filtered "$coverage_dir" "$min_sites" || {
-            rm -f "$log_dir/coverage_filter.ok"
-            echo "ERROR: coverage-filtered output is invalid for $sample" >&2
-            return 1
-        }
+        run_logged coverage_filter "$log_dir/coverage_filter.log" "$log_dir/coverage_filter.ok" \
+            methscan filter "${filter_args[@]}" "$compact_dir" "$coverage_dir" || return 1
+        write_filter_provenance "$coverage_dir" "$compact_dir" "$min_sites"
+        valid_coverage_filtered "$coverage_dir" "$min_sites" || return 1
     fi
 
-    # ---------- [4/8b] Scanpy filter：仅保留 clean singlets 后再 smooth ----------
     if [[ -s "$log_dir/filter.ok" ]] && valid_filtered "$filtered_dir" "$min_sites"; then
-        echo "    [4/8 SKIP] Scanpy clean-cell filter"
+        echo "    [4/8 REUSE] Scanpy clean-cell filter"
     else
-        refuse_untrusted_partial "$filtered_dir" "$log_dir/filter.ok" scanpy_filter ||
-            return 1
-        run_logged scanpy_keep \
-            "$log_dir/scanpy_keep.log" "$log_dir/scanpy_keep.ok" \
+        require_empty "$filtered_dir" Scanpy-filter || return 1
+        run_logged scanpy_keep "$log_dir/scanpy_keep.log" "$log_dir/scanpy_keep.ok" \
             python "$SCANPY_KEEP_SCRIPT" \
                 --methscan-header "$coverage_dir/column_header.txt" \
-                --annotation "$SCANPY_CLEAN_CSV" \
-                --sample-name "$sample" \
-                --sample-short "$sample_short" \
-                --output "$scanpy_keep_file" || return 1
-        [[ -s "$scanpy_keep_file" ]] || {
-            rm -f "$log_dir/scanpy_keep.ok"
-            echo "ERROR: Scanpy clean-cell keep list is empty for $sample" >&2
-            return 1
-        }
-
+                --annotation "$SCANPY_CLEAN_CSV" --sample-name "$sample" \
+                --sample-short "$short" --output "$keep_file" || return 1
         mkdir -p "$filtered_dir"
         run_logged scanpy_filter "$log_dir/filter.log" "$log_dir/filter.ok" \
-            methscan filter \
-                --cell-names "$scanpy_keep_file" \
-                --keep \
-                "$coverage_dir" "$filtered_dir" || return 1
-        expected_scanpy_cells="$(awk 'NF { n++ } END { print n + 0 }' "$scanpy_keep_file")"
-        actual_scanpy_cells="$(count_cells "$filtered_dir")"
-        if [[ "$actual_scanpy_cells" -ne "$expected_scanpy_cells" ]]; then
-            rm -f "$log_dir/filter.ok"
-            echo "ERROR: Scanpy filter kept $actual_scanpy_cells cells; expected $expected_scanpy_cells" >&2
-            return 1
-        fi
-        write_scanpy_filter_provenance \
-            "$filtered_dir" "$coverage_dir" "$compact_dir" "$min_sites" \
-            "$scanpy_keep_file" || {
-            rm -f "$log_dir/filter.ok"
+            methscan filter --cell-names "$keep_file" --keep "$coverage_dir" "$filtered_dir" || return 1
+        expected="$(awk 'NF { n++ } END { print n + 0 }' "$keep_file")"
+        actual="$(count_cells "$filtered_dir")"
+        [[ "$actual" -eq "$expected" ]] || {
+            echo "ERROR: Scanpy filter kept $actual cells; expected $expected" >&2
             return 1
         }
-        valid_filtered "$filtered_dir" "$min_sites" || {
-            rm -f "$log_dir/filter.ok"
-            echo "ERROR: Scanpy-filtered output or provenance is invalid for $sample" >&2
-            return 1
-        }
+        write_filter_provenance "$filtered_dir" "$compact_dir" "$min_sites" "$coverage_dir" "$keep_file"
+        valid_filtered "$filtered_dir" "$min_sites" || return 1
     fi
 
-    # ---------- [5/8] Smooth：在 filtered 数据上原位平滑 ----------
     if [[ -s "$log_dir/smooth.ok" ]] && valid_smooth "$filtered_dir"; then
-        echo "    [5/8 SKIP] smooth"
+        echo "    [5/8 REUSE] smooth"
     else
-        refuse_untrusted_partial "$filtered_dir/smoothed" "$log_dir/smooth.ok" smooth ||
-            return 1
+        require_empty "$filtered_dir/smoothed" smooth || return 1
         run_logged smooth "$log_dir/smooth.log" "$log_dir/smooth.ok" \
             methscan smooth "$filtered_dir" || return 1
-        valid_smooth "$filtered_dir" || {
-            rm -f "$log_dir/smooth.ok"
-            echo "ERROR: smooth output failed validation" >&2
-            return 1
-        }
+        valid_smooth "$filtered_dir" || return 1
     fi
 
-    # MethSCAn diff/DMR 只需要 filtered + smoothed 数据。
     if [[ "$STOP_AFTER_SMOOTH" == 1 ]]; then
-        echo "    [6/8 SKIP] scan not requested (DMR input mode)"
-        echo "    [7/8 SKIP] matrix not requested (DMR input mode)"
         echo "<<< $sample $threshold DMR input ready"
         return 0
     fi
 
-    # ---------- [6/8] Scan：发现 VMR ----------
     if [[ -s "$log_dir/scan.ok" ]] && valid_scan "$scan_dir"; then
-        echo "    [6/8 SKIP] scan"
+        echo "    [6/8 REUSE] scan"
     else
-        refuse_untrusted_partial "$scan_dir" "$log_dir/scan.ok" scan || return 1
+        require_empty "$scan_dir" scan || return 1
         mkdir -p "$scan_dir"
         run_logged scan "$log_dir/scan.log" "$log_dir/scan.ok" \
             methscan scan --threads "$threads" "$filtered_dir" "$scan_dir/VMRs.bed" || return 1
-        valid_scan "$scan_dir" || {
-            rm -f "$log_dir/scan.ok"
-            echo "ERROR: scan exited successfully but VMRs.bed is empty" >&2
-            return 1
-        }
+        valid_scan "$scan_dir" || return 1
     fi
 
-    # ---------- [7/8] Matrix：生成每细胞 × VMR 矩阵 ----------
     if [[ -s "$log_dir/matrix.ok" ]] && valid_matrix "$matrix_dir"; then
-        echo "    [7/8 SKIP] matrix"
+        echo "    [7/8 REUSE] matrix"
     else
-        refuse_untrusted_partial "$matrix_dir" "$log_dir/matrix.ok" matrix || return 1
+        require_empty "$matrix_dir" matrix || return 1
         mkdir -p "$matrix_dir"
         run_logged matrix "$log_dir/matrix.log" "$log_dir/matrix.ok" \
             methscan matrix --threads "$threads" "$scan_dir/VMRs.bed" \
-            "$filtered_dir" "$matrix_dir" || return 1
-        valid_matrix "$matrix_dir" || {
-            rm -f "$log_dir/matrix.ok"
-            echo "ERROR: matrix exited successfully but expected files are missing" >&2
-            return 1
-        }
+                "$filtered_dir" "$matrix_dir" || return 1
+        valid_matrix "$matrix_dir" || return 1
     fi
-
     echo "<<< $sample $threshold complete"
 }
 
-# ==============================================================================
-# 8. 环境初始化、受控并发与失败汇总
-# ==============================================================================
-
 run_samples() {
-    local threshold="$1"
-    local max_jobs="$2"
-    local threads="$3"
-    local selected_sample="${4:-all}"
-    local sample_dir
-    local failures=0
-    local i
-    local -a pids=()
-    local -a names=()
-
-    # 仅 run 模式需要加载计算环境；status 模式保持只读且不依赖 Conda。
-    echo "[1/8 CHECK] initialize environment and validate global inputs"
-    [[ -s "$CONDA_INIT" ]] || die "Conda initialization script not found: $CONDA_INIT"
-    source "$CONDA_INIT" || die "failed to initialize Conda from $CONDA_INIT"
-    conda activate "$CONDA_ENV" || die "failed to activate Conda environment: $CONDA_ENV"
-    command -v methscan >/dev/null 2>&1 || die "methscan is not available in $CONDA_ENV"
-    [[ -s "$TSS_BED" ]] || die "TSS BED not found or empty: $TSS_BED"
-    command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required for TSS provenance checks"
+    local threshold="$1" max_jobs="$2" threads="$3" selected="${4:-all}"
+    activate_conda
+    command -v methscan >/dev/null || die "methscan is unavailable in $CONDA_ENV"
+    [[ -s "$TSS_BED" ]] || die "TSS BED missing: $TSS_BED"
     TSS_SHA256="$(sha256sum "$TSS_BED" | awk '{print $1}')"
-    [[ "$TSS_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "failed to calculate TSS BED SHA-256"
-    SCRIPT_SHA256="$(sha256sum "${BASH_SOURCE[0]}" | awk '{print $1}')"
-    [[ "$SCRIPT_SHA256" =~ ^[0-9a-f]{64}$ ]] || die "failed to calculate pipeline SHA-256"
     collect_samples
-
-    # 指定样本时只运行该目录；all 则保留完整样本列表。
-    if [[ "$selected_sample" != all ]]; then
-        local selected_dir="$BASE_DIR/$selected_sample"
-        [[ -d "$selected_dir" ]] || die "sample directory not found: $selected_dir"
-        [[ "$selected_sample" == *_Met ]] || die "invalid sample name: $selected_sample"
-        SAMPLE_DIRS=("$selected_dir")
+    if [[ "$selected" != all ]]; then
+        [[ -d "$BASE_DIR/$selected" ]] || die "sample directory missing: $BASE_DIR/$selected"
+        sample_short "$selected" >/dev/null || die "invalid sample name: $selected"
+        SAMPLE_DIRS=("$BASE_DIR/$selected")
     fi
-
-    # 等待当前批次全部后台任务，并逐个汇总退出状态。
-    wait_batch() {
-        for i in "${!pids[@]}"; do
-            if wait "${pids[$i]}"; then
-                echo "[8/8 SAMPLE OK] ${names[$i]}"
-            else
-                echo "[8/8 SAMPLE FAIL] ${names[$i]}" >&2
-                failures=$((failures + 1))
-            fi
-        done
-        pids=()
-        names=()
-    }
-
-    # 按 max_jobs 分批启动，避免旧脚本一次性并发全部样本。
-    echo "=== threshold=$threshold max_jobs=$max_jobs threads_per_job=$threads sample=$selected_sample ==="
-    echo "=== qc_tag=$QC_TAG min_meth=$FILTER_MIN_METH max_meth=$FILTER_MAX_METH_LABEL max_sites=$FILTER_MAX_SITES ==="
-    echo "=== scanpy_clean_csv=$SCANPY_CLEAN_CSV sha256=$SCANPY_CLEAN_SHA256 ==="
-    echo "=== tss_bed=$TSS_BED sha256=$TSS_SHA256 ==="
-    for sample_dir in "${SAMPLE_DIRS[@]}"; do
-        run_one_sample "$sample_dir" "$threshold" "$threads" &
-        pids+=("$!")
-        names+=("${sample_dir##*/}")
-
-        if [[ "${#pids[@]}" -ge "$max_jobs" ]]; then
-            wait_batch
-        fi
-    done
-    [[ "${#pids[@]}" -eq 0 ]] || wait_batch
-
-    if [[ "$failures" -gt 0 ]]; then
-        echo "[8/8 FAIL] $failures sample(s) failed" >&2
-        return 1
-    fi
+    echo "=== threshold=$threshold jobs=$max_jobs threads=$threads qc_tag=$QC_TAG ==="
+    run_sample_batches "$max_jobs" run_one_sample "$threshold" "$threads" ||
+        die "$BATCH_FAILURES sample(s) failed"
     echo "[8/8 OK] ALL SAMPLES COMPLETE"
 }
 
-# ==============================================================================
-# 9. 命令行入口
-# ==============================================================================
-
 main() {
-    local action="${1:-}"
-    local threshold="${2:-}"
-    local max_jobs="${3:-$DEFAULT_MAX_JOBS}"
-    local threads="${4:-$DEFAULT_THREADS}"
-    local selected_sample="${5:-all}"
-
-    validate_filter_config
-
+    local action="${1:-}" threshold="${2:-}"
+    local max_jobs="${3:-$DEFAULT_MAX_JOBS}" threads="${4:-$DEFAULT_THREADS}"
+    local selected="${5:-all}"
+    validate_config
     case "$action" in
         status)
-            initialize_scanpy_provenance
+            initialize_provenance
             show_status "$threshold"
             ;;
         run|run-to-compact|run-to-smooth)
-            [[ -n "$threshold" ]] || die "run requires a threshold"
             is_threshold "$threshold" || die "invalid threshold: $threshold"
-            is_positive_integer "$max_jobs" || die "max_jobs must be a positive integer"
-            is_positive_integer "$threads" || die "threads must be a positive integer"
-            initialize_scanpy_provenance
-            if [[ "$action" == run-to-compact ]]; then
-                STOP_AFTER_PREPARE=1
-            elif [[ "$action" == run-to-smooth ]]; then
-                STOP_AFTER_SMOOTH=1
-            fi
-            run_samples "$threshold" "$max_jobs" "$threads" "$selected_sample"
+            is_positive_integer "$max_jobs" || die "max_jobs must be positive"
+            is_positive_integer "$threads" || die "threads must be positive"
+            initialize_provenance
+            [[ "$action" != run-to-compact ]] || STOP_AFTER_PREPARE=1
+            [[ "$action" != run-to-smooth ]] || STOP_AFTER_SMOOTH=1
+            run_samples "$threshold" "$max_jobs" "$threads" "$selected"
             ;;
-        -h|--help|help)
-            usage
-            ;;
-        *)
-            usage >&2
-            exit 1
-            ;;
+        -h|--help|help) usage ;;
+        *) usage >&2; return 1 ;;
     esac
 }
 
-# 直接执行时进入主程序；被测试脚本 source 时只加载函数。
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     main "$@"
 fi

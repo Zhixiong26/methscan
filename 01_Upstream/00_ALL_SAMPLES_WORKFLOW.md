@@ -61,7 +61,7 @@ null-FDR回退状态与补跑：
 
 ```bash
 bash 09_rerun_rawp_no_null_fdr.sh status
-bash 09_rerun_rawp_no_null_fdr.sh all 2 16
+bash 09_rerun_rawp_no_null_fdr.sh run 2 16
 ```
 
 ## 8类正式热图

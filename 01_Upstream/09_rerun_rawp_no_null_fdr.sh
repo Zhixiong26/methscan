@@ -18,12 +18,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BASE_DIR="${BASE_DIR:-/share/LCZX_Data/data/allcools}"
-QC_TAG="${QC_TAG:-minmeth55_maxmethnone_maxsites1200000_scanpy0814clean_covdedupprob}"
-THRESHOLD="${THRESHOLD:-300k}"
+source "$SCRIPT_DIR/lib/workflow_common.sh"
 MIN_CELLS="${MIN_CELLS:-10}"
-CONDA_INIT="${CONDA_INIT:-/share/home/rzli/miniconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-scDNAm}"
 FALLBACK_PACKAGE_ROOT="${FALLBACK_PACKAGE_ROOT:-$SCRIPT_DIR/.rawp_fallback_methscan}"
 PATCH_REVISION="rawp_no_null_dmrs_v2"
 
@@ -44,25 +40,13 @@ ZeroDivisionError at calc_fdr are eligible for this fallback.
 EOF
 }
 
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
-
-is_positive_integer() {
-    [[ "$1" =~ ^[1-9][0-9]*$ ]]
-}
-
 require_wait_n() {
     help wait 2>/dev/null | grep -Eq '(^|[[:space:]])-n([[:space:],]|$)' ||
         die "Bash wait -n support is required for rolling parallel execution"
 }
 
 initialize_environment() {
-    [[ -s "$CONDA_INIT" ]] || die "conda initialization missing: $CONDA_INIT"
-    # shellcheck disable=SC1090
-    source "$CONDA_INIT"
-    conda activate "$CONDA_ENV"
+    activate_conda
     command -v python >/dev/null || die "python unavailable after activating $CONDA_ENV"
     command -v methscan >/dev/null || die "methscan unavailable after activating $CONDA_ENV"
 }
@@ -274,10 +258,9 @@ run_one() {
 }
 
 collect_failures() {
-    local sample log_dir log comparison
-    local -a samples=()
-    mapfile -t samples < <(find "$BASE_DIR" -maxdepth 1 -type d -name '25110891_*_Met' -printf '%f\n' | sort)
-    for sample in "${samples[@]}"; do
+    local short sample log_dir log comparison
+    for short in "${SAMPLE_SHORTS[@]}"; do
+        sample="$(sample_name "$short")"
         log_dir="$(original_log_dir "$sample")"
         [[ -d "$log_dir" ]] || continue
         for log in "$log_dir"/*.log; do
@@ -372,9 +355,9 @@ run_pilot() {
 
 main() {
     local action="${1:-help}"
-    initialize_environment
     case "$action" in
         status)
+            initialize_environment
             echo 'sample	comparison	fallback_status'
             while IFS=$'\t' read -r sample comparison; do
                 if valid_fallback_comparison "$sample" "$comparison"; then
@@ -385,9 +368,11 @@ main() {
             done < <(collect_failures)
             ;;
         pilot)
+            initialize_environment
             run_pilot "${2:-}" "${3:-}" "${4:-}"
             ;;
         run)
+            initialize_environment
             run_all "${2:-8}" "${3:-16}"
             ;;
         -h|--help|help)

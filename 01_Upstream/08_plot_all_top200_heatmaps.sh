@@ -6,18 +6,13 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/workflow_common.sh"
 RESULT_SCRIPT_DIR="${RESULT_SCRIPT_DIR:-${SCRIPT_DIR}/lib/methdiff/python}"
-BASE_DIR="${BASE_DIR:-/share/LCZX_Data/data/allcools}"
-THRESHOLD="${THRESHOLD:-300k}"
-QC_TAG="${QC_TAG:-minmeth55_maxmethnone_maxsites1200000_scanpy0814clean_covdedupprob}"
-EXPECTED_SAMPLES="${EXPECTED_SAMPLES:-10}"
 SAMPLE_JOBS="${SAMPLE_JOBS:-2}"
 PLOT_DPI="${PLOT_DPI:-300}"
 ZSCORE_MIN_OBSERVED_CELLS="${ZSCORE_MIN_OBSERVED_CELLS:-30}"
 ZSCORE_STANDARD_CLIP="${ZSCORE_STANDARD_CLIP:-3}"
 PLOT_OVERWRITE="${PLOT_OVERWRITE:-0}"
-CONDA_INIT="${CONDA_INIT:-/share/home/rzli/miniconda3/etc/profile.d/conda.sh}"
-CONDA_ENV="${CONDA_ENV:-scDNAm}"
 RESULT_LINK_DIR="${RESULT_LINK_DIR:-${SCRIPT_DIR}/result}"
 
 ACTION="${1:-all}"
@@ -48,21 +43,6 @@ Environment:
   ZSCORE_STANDARD_CLIP=3
   PLOT_OVERWRITE=0
 EOF
-}
-
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
-
-is_positive_integer() {
-    [[ "$1" =~ ^[1-9][0-9]*$ ]]
-}
-
-sample_short() {
-    local sample_name="$1"
-    [[ "$sample_name" =~ ^25110891_((IR|NR)[0-9]{2})_Met$ ]] || return 1
-    printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
 # Fields: ID | output directory | transform | exact DMRs | save NPZ | clip |
@@ -112,7 +92,7 @@ analysis_root_for_sample() {
 print_status() {
     local sample spec variant_id figure_name remainder root figure_dir png status
     printf 'sample\tvariant\tplot_status\n'
-    for sample in IR01 IR02 IR03 IR04 IR05 NR01 NR02 NR03 NR04 NR05; do
+    for sample in "${SAMPLE_SHORTS[@]}"; do
         root="$(analysis_root_for_sample "$sample")"
         for spec in "${ALL_VARIANTS[@]}"; do
             variant_id="${spec%%|*}"
@@ -151,7 +131,7 @@ refresh_links() {
         mkdir -p "$staging/$group" || die "failed to create link group: $group"
     done
 
-    for sample in IR01 IR02 IR03 IR04 IR05 NR01 NR02 NR03 NR04 NR05; do
+    for sample in "${SAMPLE_SHORTS[@]}"; do
         root="$(analysis_root_for_sample "$sample")"
         for spec in "${ALL_VARIANTS[@]}"; do
             IFS='|' read -r variant_id figure_name transform exact save_matrix clip \
@@ -300,12 +280,8 @@ case "$ACTION" in
 esac
 
 [[ "${#SELECTED_VARIANTS[@]}" -gt 0 ]] || die "no variants selected for: $ACTION"
-[[ -s "$CONDA_INIT" ]] || die "Conda initialization missing: $CONDA_INIT"
-# shellcheck disable=SC1090
-source "$CONDA_INIT" || die "failed to initialize Conda"
-conda activate "$CONDA_ENV" || die "failed to activate Conda env: $CONDA_ENV"
+activate_conda
 [[ "$THRESHOLD" == 300k ]] || die "current workflow requires THRESHOLD=300k"
-is_positive_integer "$EXPECTED_SAMPLES" || die "EXPECTED_SAMPLES must be positive"
 is_positive_integer "$SAMPLE_JOBS" || die "SAMPLE_JOBS must be positive"
 is_positive_integer "$PLOT_DPI" || die "PLOT_DPI must be positive"
 is_positive_integer "$ZSCORE_MIN_OBSERVED_CELLS" ||
@@ -315,31 +291,7 @@ is_positive_integer "$ZSCORE_MIN_OBSERVED_CELLS" ||
 [[ "$PLOT_OVERWRITE" == 0 || "$PLOT_OVERWRITE" == 1 ]] ||
     die "PLOT_OVERWRITE must be 0 or 1"
 
-SAMPLE_DIRS=()
-while IFS= read -r sample_dir; do
-    SAMPLE_DIRS+=("$sample_dir")
-done < <(find "$BASE_DIR" -maxdepth 1 -type d -name '*_Met' | sort)
-[[ "${#SAMPLE_DIRS[@]}" -eq "$EXPECTED_SAMPLES" ]] ||
-    die "found ${#SAMPLE_DIRS[@]} samples; expected $EXPECTED_SAMPLES"
-
-failures=0
-for ((offset = 0; offset < ${#SAMPLE_DIRS[@]}; offset += SAMPLE_JOBS)); do
-    pids=()
-    names=()
-    for ((i = offset; i < offset + SAMPLE_JOBS && i < ${#SAMPLE_DIRS[@]}; i++)); do
-        process_sample "${SAMPLE_DIRS[$i]}" &
-        pids+=("$!")
-        names+=("${SAMPLE_DIRS[$i]##*/}")
-    done
-    for i in "${!pids[@]}"; do
-        if wait "${pids[$i]}"; then
-            echo "[SAMPLE OK] ${names[$i]}"
-        else
-            echo "[SAMPLE FAIL] ${names[$i]}" >&2
-            failures=$((failures + 1))
-        fi
-    done
-done
-
-[[ "$failures" -eq 0 ]] || die "$failures sample(s) failed unified plotting"
+collect_samples
+run_sample_batches "$SAMPLE_JOBS" process_sample ||
+    die "$BATCH_FAILURES sample(s) failed unified plotting"
 echo "[ALL SAMPLES OK] unified Top200 heatmaps complete: mode=$ACTION"

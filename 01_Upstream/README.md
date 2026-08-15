@@ -2,6 +2,8 @@
 
 本目录只保留已运行成功的`01–09`单样本流程，并在`lib/methdiff/`内集成原`02_Methdiff`的必要实现。分析单位始终是单个样本；10个样本可并行，但不合并compact、不构建联合pseudobulk、不执行跨样本DMR。
 
+`lib/workflow_common.sh`集中管理10个样本名、Scanpy路径、QC tag、Conda环境和通用并发。顶层脚本只保留各阶段的业务流程；计算公式仍位于`lib/methdiff/`中的原验证实现。
+
 主要数据流：
 
 ```text
