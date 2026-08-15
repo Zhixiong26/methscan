@@ -24,7 +24,7 @@ SAMPLE_SHORT="${SAMPLE_SHORT:-$DERIVED_SAMPLE_SHORT}"
     exit 1
 }
 SAMPLE_DIR="/share/LCZX_Data/data/allcools/${SAMPLE_NAME}"
-QC_TAG="minmeth55_maxmethnone_maxsites1200000_covdedupprob"
+QC_TAG="minmeth55_maxmethnone_maxsites1200000_scanpy0814clean_covdedupprob"
 THRESHOLD="${THRESHOLD:-30k}"
 QC_ROOT="${SAMPLE_DIR}/qc_${QC_TAG}"
 DATA_DIR="${DATA_DIR:-${QC_ROOT}/filtered_data_single_${THRESHOLD}}"

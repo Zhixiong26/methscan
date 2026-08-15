@@ -19,7 +19,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${BASE_DIR:-/share/LCZX_Data/data/allcools}"
-QC_TAG="${QC_TAG:-minmeth55_maxmethnone_maxsites1200000_covdedupprob}"
+QC_TAG="${QC_TAG:-minmeth55_maxmethnone_maxsites1200000_scanpy0814clean_covdedupprob}"
 THRESHOLD="${THRESHOLD:-300k}"
 MIN_CELLS="${MIN_CELLS:-10}"
 CONDA_INIT="${CONDA_INIT:-/share/home/rzli/miniconda3/etc/profile.d/conda.sh}"

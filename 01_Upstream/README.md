@@ -8,16 +8,18 @@
 cov
   → cov_dedup_probability
   → compact_data_dedup_probability
-  → filtered_data_single_300k
+  → filtered_coverage_single_300k (30万–120万 coverage)
+  → filtered_data_single_300k (Scanpy clean singlets)
   → smoothed
   → methdiff_celltype_300k
   → Top200 → single-cell DMR matrix → 8类热图
 ```
 
-注释固定为：
+注释与 smooth 前 clean-cell 名单分别固定为：
 
 ```text
 /share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_all_cells.csv
+/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_clean_cells.csv
 ```
 
 统一热图入口：

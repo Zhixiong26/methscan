@@ -28,6 +28,7 @@ set -uo pipefail
 #    所有配置均可在命令前通过同名环境变量覆盖。
 # ==============================================================================
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${BASE_DIR:-/share/LCZX_Data/data/allcools}"
 DATA_TAG="${DATA_TAG:-covdedupprob}"
 COV_SUBDIR="${COV_SUBDIR:-cov_dedup_probability}"
@@ -42,14 +43,18 @@ DEFAULT_THREADS="${DEFAULT_THREADS:-20}"
 FILTER_MIN_METH="${FILTER_MIN_METH:-55}"
 FILTER_MAX_METH="${FILTER_MAX_METH:-}"
 FILTER_MAX_SITES="${FILTER_MAX_SITES:-1200000}"
+SCANPY_CLEAN_CSV="${SCANPY_CLEAN_CSV:-/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_clean_cells.csv}"
+SCANPY_FILTER_LABEL="${SCANPY_FILTER_LABEL:-scanpy0814clean}"
+SCANPY_KEEP_SCRIPT="${SCANPY_KEEP_SCRIPT:-${SCRIPT_DIR}/lib/build_scanpy_clean_cell_list.py}"
 VALID_THRESHOLDS=(10k 20k 30k 50k 300k)
 TSS_SHA256=""
 SCRIPT_SHA256=""
+SCANPY_CLEAN_SHA256=""
 STOP_AFTER_SMOOTH="${STOP_AFTER_SMOOTH:-0}"
 STOP_AFTER_PREPARE="${STOP_AFTER_PREPARE:-0}"
 
 FILTER_MAX_METH_LABEL="${FILTER_MAX_METH:-none}"
-QC_TAG="minmeth${FILTER_MIN_METH}_maxmeth${FILTER_MAX_METH_LABEL}_maxsites${FILTER_MAX_SITES}"
+QC_TAG="minmeth${FILTER_MIN_METH}_maxmeth${FILTER_MAX_METH_LABEL}_maxsites${FILTER_MAX_SITES}_${SCANPY_FILTER_LABEL}"
 QC_TAG="${QC_TAG//./p}"
 
 # ==============================================================================
@@ -116,7 +121,22 @@ validate_filter_config() {
         die "FILTER_MAX_SITES must be a positive integer"
     [[ "$FILTER_MAX_SITES" -ge 300000 ]] ||
         die "FILTER_MAX_SITES must be at least the largest min-sites threshold (300000)"
+    [[ "$SCANPY_FILTER_LABEL" =~ ^[A-Za-z0-9._-]+$ ]] ||
+        die "SCANPY_FILTER_LABEL contains unsupported characters"
     [[ "$QC_TAG" =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid derived QC tag: $QC_TAG"
+}
+
+# 计算 clean-cell 注释文件哈希，使同一路径内容更新后不能误用旧产物。
+initialize_scanpy_provenance() {
+    [[ -s "$SCANPY_CLEAN_CSV" ]] ||
+        die "Scanpy clean-cell annotation missing: $SCANPY_CLEAN_CSV"
+    [[ -s "$SCANPY_KEEP_SCRIPT" ]] ||
+        die "Scanpy keep-list helper missing: $SCANPY_KEEP_SCRIPT"
+    command -v sha256sum >/dev/null 2>&1 ||
+        die "sha256sum is required for Scanpy annotation provenance checks"
+    SCANPY_CLEAN_SHA256="$(sha256sum "$SCANPY_CLEAN_CSV" | awk '{print $1}')"
+    [[ "$SCANPY_CLEAN_SHA256" =~ ^[0-9a-f]{64}$ ]] ||
+        die "failed to calculate Scanpy clean-cell annotation SHA-256"
 }
 
 # ==============================================================================
@@ -152,8 +172,8 @@ valid_compact() {
         grep -q .
 }
 
-# 检查 filtered 数据是否由当前过滤参数生成。
-valid_filter_provenance() {
+# 检查 coverage-filtered 数据是否由当前覆盖度与甲基化阈值生成。
+valid_coverage_filter_provenance() {
     local dir="$1"
     local min_sites="$2"
     local metadata="$dir/filter_provenance.tsv"
@@ -172,7 +192,34 @@ valid_filter_provenance() {
         ' "$metadata"
 }
 
-# filtered 目录结构与 compact 相同；NPZ 是染色体矩阵，不是单个细胞。
+# coverage-filtered 目录结构与 compact 相同。
+valid_coverage_filtered() {
+    local dir="$1"
+    local min_sites="$2"
+    valid_compact "$dir" &&
+        [[ "$(count_cells "$dir")" -gt 0 ]] &&
+        valid_coverage_filter_provenance "$dir" "$min_sites"
+}
+
+# 最终 filtered 数据还必须匹配当前 Scanpy clean-cell 注释及其 SHA-256。
+valid_filter_provenance() {
+    local dir="$1"
+    local min_sites="$2"
+    local metadata="$dir/filter_provenance.tsv"
+
+    valid_coverage_filter_provenance "$dir" "$min_sites" &&
+        awk -F '\t' \
+            -v annotation="$SCANPY_CLEAN_CSV" \
+            -v annotation_sha="$SCANPY_CLEAN_SHA256" \
+            -v label="$SCANPY_FILTER_LABEL" '
+            $1 == "scanpy_clean_csv" && $2 == annotation { a = 1 }
+            $1 == "scanpy_clean_sha256" && $2 == annotation_sha { b = 1 }
+            $1 == "scanpy_filter_label" && $2 == label { c = 1 }
+            END { exit(a && b && c ? 0 : 1) }
+        ' "$metadata"
+}
+
+# 最终 filtered 目录只包含同时通过 coverage 与 Scanpy clean-cell 筛选的细胞。
 valid_filtered() {
     local dir="$1"
     local min_sites="$2"
@@ -268,12 +315,18 @@ valid_qc_config() {
             -v qc_tag="$QC_TAG" \
             -v max_sites="$FILTER_MAX_SITES" \
             -v min_meth="$FILTER_MIN_METH" \
-            -v max_meth="$FILTER_MAX_METH_LABEL" '
+            -v max_meth="$FILTER_MAX_METH_LABEL" \
+            -v annotation="$SCANPY_CLEAN_CSV" \
+            -v annotation_sha="$SCANPY_CLEAN_SHA256" \
+            -v scanpy_label="$SCANPY_FILTER_LABEL" '
             $1 == "qc_tag" && $2 == qc_tag { a = 1 }
             $1 == "max_sites" && $2 == max_sites { b = 1 }
             $1 == "min_meth" && $2 == min_meth { c = 1 }
             $1 == "max_meth" && $2 == max_meth { d = 1 }
-            END { exit(a && b && c && d ? 0 : 1) }
+            $1 == "scanpy_clean_csv" && $2 == annotation { e = 1 }
+            $1 == "scanpy_clean_sha256" && $2 == annotation_sha { f = 1 }
+            $1 == "scanpy_filter_label" && $2 == scanpy_label { g = 1 }
+            END { exit(a && b && c && d && e && f && g ? 0 : 1) }
         ' "$metadata"
 }
 
@@ -299,6 +352,9 @@ ensure_qc_config() {
         printf 'max_sites\t%s\n' "$FILTER_MAX_SITES"
         printf 'min_meth\t%s\n' "$FILTER_MIN_METH"
         printf 'max_meth\t%s\n' "$FILTER_MAX_METH_LABEL"
+        printf 'scanpy_clean_csv\t%s\n' "$SCANPY_CLEAN_CSV"
+        printf 'scanpy_clean_sha256\t%s\n' "$SCANPY_CLEAN_SHA256"
+        printf 'scanpy_filter_label\t%s\n' "$SCANPY_FILTER_LABEL"
         printf 'script_sha256\t%s\n' "$SCRIPT_SHA256"
         printf 'created_at\t%s\n' "$(date -Is)"
     } >"$tmp"; then
@@ -309,8 +365,8 @@ ensure_qc_config() {
     mv "$tmp" "$metadata"
 }
 
-# 在 filtered 目录中记录阈值、输入目录和过滤前后细胞数。
-write_filter_provenance() {
+# 记录第一阶段 coverage 过滤的阈值、输入目录和过滤前后细胞数。
+write_coverage_filter_provenance() {
     local filtered_dir="$1"
     local compact_dir="$2"
     local min_sites="$3"
@@ -335,6 +391,45 @@ write_filter_provenance() {
     mv "$tmp" "$metadata"
 }
 
+# 记录第二阶段 Scanpy clean-cell 过滤及其可复现来源。
+write_scanpy_filter_provenance() {
+    local filtered_dir="$1"
+    local coverage_dir="$2"
+    local compact_dir="$3"
+    local min_sites="$4"
+    local keep_file="$5"
+    local metadata="$filtered_dir/filter_provenance.tsv"
+    local tmp="${metadata}.tmp.$$"
+    local keep_sha256
+
+    keep_sha256="$(sha256sum "$keep_file" | awk '{print $1}')" || return 1
+    [[ "$keep_sha256" =~ ^[0-9a-f]{64}$ ]] || return 1
+
+    if ! {
+        printf 'qc_tag\t%s\n' "$QC_TAG"
+        printf 'min_sites\t%s\n' "$min_sites"
+        printf 'max_sites\t%s\n' "$FILTER_MAX_SITES"
+        printf 'min_meth\t%s\n' "$FILTER_MIN_METH"
+        printf 'max_meth\t%s\n' "$FILTER_MAX_METH_LABEL"
+        printf 'input_compact\t%s\n' "$compact_dir"
+        printf 'coverage_filtered_dir\t%s\n' "$coverage_dir"
+        printf 'scanpy_clean_csv\t%s\n' "$SCANPY_CLEAN_CSV"
+        printf 'scanpy_clean_sha256\t%s\n' "$SCANPY_CLEAN_SHA256"
+        printf 'scanpy_filter_label\t%s\n' "$SCANPY_FILTER_LABEL"
+        printf 'scanpy_keep_file\t%s\n' "$keep_file"
+        printf 'scanpy_keep_sha256\t%s\n' "$keep_sha256"
+        printf 'cells_before\t%s\n' "$(count_cells "$compact_dir")"
+        printf 'cells_after_coverage\t%s\n' "$(count_cells "$coverage_dir")"
+        printf 'cells_after\t%s\n' "$(count_cells "$filtered_dir")"
+        printf 'created_at\t%s\n' "$(date -Is)"
+    } >"$tmp"; then
+        rm -f "$tmp"
+        echo "ERROR: failed to write Scanpy filter provenance: $metadata" >&2
+        return 1
+    fi
+    mv "$tmp" "$metadata"
+}
+
 # ==============================================================================
 # 5. 日志管理与状态盘点
 # ==============================================================================
@@ -352,7 +447,7 @@ stage_number() {
     case "$1" in
         prepare) printf '2' ;;
         profile) printf '3' ;;
-        filter) printf '4' ;;
+        filter|coverage_filter|scanpy_keep|scanpy_filter) printf '4' ;;
         smooth) printf '5' ;;
         scan) printf '6' ;;
         matrix) printf '7' ;;
@@ -430,8 +525,9 @@ show_status() {
     fi
 
     collect_samples
-    printf '# qc_tag=%s min_meth=%s max_meth=%s max_sites=%s\n' \
-        "$QC_TAG" "$FILTER_MIN_METH" "$FILTER_MAX_METH_LABEL" "$FILTER_MAX_SITES"
+    printf '# qc_tag=%s min_meth=%s max_meth=%s max_sites=%s scanpy_clean_sha256=%s\n' \
+        "$QC_TAG" "$FILTER_MIN_METH" "$FILTER_MAX_METH_LABEL" \
+        "$FILTER_MAX_SITES" "$SCANPY_CLEAN_SHA256"
     printf 'sample\tthreshold\tcompact_cells\tfiltered_cells\tVMRs\tmatrix_files\tlogs\n'
     for sample_dir in "${SAMPLE_DIRS[@]}"; do
         if [[ -n "$requested" ]]; then
@@ -477,13 +573,23 @@ run_one_sample() {
     local threads="$3"
     local min_sites="${threshold%k}000"
     local sample="${sample_dir##*/}"
+    local sample_short
+    if [[ "$sample" =~ ^25110891_((IR|NR)[0-9]{2})_Met$ ]]; then
+        sample_short="${BASH_REMATCH[1]}"
+    else
+        echo "ERROR: unsupported sample name: $sample" >&2
+        return 1
+    fi
     local qc_root
     qc_root="$(qc_root_for_sample "$sample_dir")"
     local log_dir="$qc_root/logs_single_${threshold}"
+    local coverage_dir="$qc_root/filtered_coverage_single_${threshold}"
     local filtered_dir="$qc_root/filtered_data_single_${threshold}"
+    local scanpy_keep_file="$log_dir/scanpy_clean_cells.keep.txt"
     local scan_dir="$qc_root/scan_results_single_${threshold}"
     local matrix_dir="$qc_root/VMR_matrix_single_${threshold}"
     local compact_dir profile_file profile_metadata cov_dir
+    local expected_scanpy_cells actual_scanpy_cells
     local -a cov_files filter_args
 
     # 全部样本固定使用各自的概率去重 cov 目录。
@@ -588,13 +694,14 @@ run_one_sample() {
         fi
     fi
 
-    # ---------- [4/8] Filter：应用覆盖度和最低甲基化阈值 ----------
-    if [[ -s "$log_dir/filter.ok" ]] && valid_filtered "$filtered_dir" "$min_sites"; then
-        echo "    [4/8 SKIP] filter"
+    # ---------- [4/8a] Coverage filter：应用覆盖度和最低甲基化阈值 ----------
+    if [[ -s "$log_dir/coverage_filter.ok" ]] &&
+        valid_coverage_filtered "$coverage_dir" "$min_sites"; then
+        echo "    [4/8 SKIP] coverage filter"
     else
-        refuse_untrusted_partial "$filtered_dir" "$log_dir/filter.ok" filter || return 1
-        mkdir -p "$filtered_dir"
-
+        refuse_untrusted_partial \
+            "$coverage_dir" "$log_dir/coverage_filter.ok" coverage_filter || return 1
+        mkdir -p "$coverage_dir"
         filter_args=(
             --min-sites "$min_sites"
             --max-sites "$FILTER_MAX_SITES"
@@ -604,16 +711,64 @@ run_one_sample() {
             filter_args+=(--max-meth "$FILTER_MAX_METH")
         fi
 
-        run_logged filter "$log_dir/filter.log" "$log_dir/filter.ok" \
+        run_logged coverage_filter \
+            "$log_dir/coverage_filter.log" "$log_dir/coverage_filter.ok" \
             methscan filter "${filter_args[@]}" \
-            "$compact_dir" "$filtered_dir" || return 1
-        write_filter_provenance "$filtered_dir" "$compact_dir" "$min_sites" || {
+            "$compact_dir" "$coverage_dir" || return 1
+        write_coverage_filter_provenance \
+            "$coverage_dir" "$compact_dir" "$min_sites" || {
+            rm -f "$log_dir/coverage_filter.ok"
+            return 1
+        }
+        valid_coverage_filtered "$coverage_dir" "$min_sites" || {
+            rm -f "$log_dir/coverage_filter.ok"
+            echo "ERROR: coverage-filtered output is invalid for $sample" >&2
+            return 1
+        }
+    fi
+
+    # ---------- [4/8b] Scanpy filter：仅保留 clean singlets 后再 smooth ----------
+    if [[ -s "$log_dir/filter.ok" ]] && valid_filtered "$filtered_dir" "$min_sites"; then
+        echo "    [4/8 SKIP] Scanpy clean-cell filter"
+    else
+        refuse_untrusted_partial "$filtered_dir" "$log_dir/filter.ok" scanpy_filter ||
+            return 1
+        run_logged scanpy_keep \
+            "$log_dir/scanpy_keep.log" "$log_dir/scanpy_keep.ok" \
+            python "$SCANPY_KEEP_SCRIPT" \
+                --methscan-header "$coverage_dir/column_header.txt" \
+                --annotation "$SCANPY_CLEAN_CSV" \
+                --sample-name "$sample" \
+                --sample-short "$sample_short" \
+                --output "$scanpy_keep_file" || return 1
+        [[ -s "$scanpy_keep_file" ]] || {
+            rm -f "$log_dir/scanpy_keep.ok"
+            echo "ERROR: Scanpy clean-cell keep list is empty for $sample" >&2
+            return 1
+        }
+
+        mkdir -p "$filtered_dir"
+        run_logged scanpy_filter "$log_dir/filter.log" "$log_dir/filter.ok" \
+            methscan filter \
+                --cell-names "$scanpy_keep_file" \
+                --keep \
+                "$coverage_dir" "$filtered_dir" || return 1
+        expected_scanpy_cells="$(awk 'NF { n++ } END { print n + 0 }' "$scanpy_keep_file")"
+        actual_scanpy_cells="$(count_cells "$filtered_dir")"
+        if [[ "$actual_scanpy_cells" -ne "$expected_scanpy_cells" ]]; then
+            rm -f "$log_dir/filter.ok"
+            echo "ERROR: Scanpy filter kept $actual_scanpy_cells cells; expected $expected_scanpy_cells" >&2
+            return 1
+        fi
+        write_scanpy_filter_provenance \
+            "$filtered_dir" "$coverage_dir" "$compact_dir" "$min_sites" \
+            "$scanpy_keep_file" || {
             rm -f "$log_dir/filter.ok"
             return 1
         }
         valid_filtered "$filtered_dir" "$min_sites" || {
             rm -f "$log_dir/filter.ok"
-            echo "ERROR: filtered output or provenance is invalid for $sample" >&2
+            echo "ERROR: Scanpy-filtered output or provenance is invalid for $sample" >&2
             return 1
         }
     fi
@@ -729,6 +884,7 @@ run_samples() {
     # 按 max_jobs 分批启动，避免旧脚本一次性并发全部样本。
     echo "=== threshold=$threshold max_jobs=$max_jobs threads_per_job=$threads sample=$selected_sample ==="
     echo "=== qc_tag=$QC_TAG min_meth=$FILTER_MIN_METH max_meth=$FILTER_MAX_METH_LABEL max_sites=$FILTER_MAX_SITES ==="
+    echo "=== scanpy_clean_csv=$SCANPY_CLEAN_CSV sha256=$SCANPY_CLEAN_SHA256 ==="
     echo "=== tss_bed=$TSS_BED sha256=$TSS_SHA256 ==="
     for sample_dir in "${SAMPLE_DIRS[@]}"; do
         run_one_sample "$sample_dir" "$threshold" "$threads" &
@@ -763,6 +919,7 @@ main() {
 
     case "$action" in
         status)
+            initialize_scanpy_provenance
             show_status "$threshold"
             ;;
         run|run-to-compact|run-to-smooth)
@@ -770,6 +927,7 @@ main() {
             is_threshold "$threshold" || die "invalid threshold: $threshold"
             is_positive_integer "$max_jobs" || die "max_jobs must be a positive integer"
             is_positive_integer "$threads" || die "threads must be a positive integer"
+            initialize_scanpy_provenance
             if [[ "$action" == run-to-compact ]]; then
                 STOP_AFTER_PREPARE=1
             elif [[ "$action" == run-to-smooth ]]; then

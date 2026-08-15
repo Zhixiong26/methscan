@@ -22,11 +22,12 @@
 
 ## 固定分析口径
 
-- Scanpy注释：`/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_all_cells.csv`
+- Scanpy DMR注释：`/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_all_cells.csv`
+- smooth前 clean-cell名单：`/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_clean_cells.csv`
 - `Monocytes`是旧`CD14_Monocytes`与`CD16_Monocytes`的合并类型
 - 排除`Platelet_erythroid_contamination`
 - 样本：`25110891_IR01–IR05_Met`、`25110891_NR01–NR05_Met`
-- 过滤：`min_sites=300000`、`max_sites=1200000`、`min_meth=55`
+- 过滤：先应用`min_sites=300000`、`max_sites=1200000`、`min_meth=55`，再与Scanpy clean singlets取交集后运行smooth
 - DMR：仅同样本内不同cell type两两比较，`min_cells=10`
 - 染色体：仅`chr1–chr22, chrX, chrY`
 - Top200：`raw p < 0.01`且`abs(methylation difference) >= 0.25`
