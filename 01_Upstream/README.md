@@ -17,7 +17,7 @@ cov
 注释固定为：
 
 ```text
-/share/home/rzli/SCANPY/20260810/Result0810/annotation/02_cell_annotation_all_cells.csv
+/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_all_cells.csv
 ```
 
 统一热图入口：

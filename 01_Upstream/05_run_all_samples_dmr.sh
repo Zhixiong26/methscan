@@ -8,7 +8,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${BASE_DIR:-/share/LCZX_Data/data/allcools}"
 DMR_SCRIPT="${DMR_SCRIPT:-${SCRIPT_DIR}/lib/methdiff/run_single_sample_dmr.sh}"
-ANNOTATION_CSV="${ANNOTATION_CSV:-/share/home/rzli/SCANPY/20260810/Result0810/annotation/02_cell_annotation_all_cells.csv}"
+ANNOTATION_CSV="${ANNOTATION_CSV:-/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_all_cells.csv}"
 THRESHOLD="${THRESHOLD:-300k}"
 EXPECTED_SAMPLES="${EXPECTED_SAMPLES:-10}"
 DEFAULT_PREPARE_JOBS="${DEFAULT_PREPARE_JOBS:-2}"
@@ -31,7 +31,7 @@ Examples:
 
 The run example permits at most 2 x 2 x 24 = 96 MethSCAn diff threads.
 All comparisons remain within one sample; no merged MethSCAn input is used.
-The default annotation is the Scanpy 20260810 Result0810 annotation. Override it
+The default annotation is the Scanpy 20260814 Result0814 annotation. Override it
 with ANNOTATION_CSV=/path/to/02_cell_annotation_all_cells.csv when needed.
 EOF
 }

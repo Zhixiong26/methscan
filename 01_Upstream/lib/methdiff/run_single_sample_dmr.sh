@@ -24,7 +24,7 @@ SAMPLE_SHORT="${SAMPLE_SHORT:-$DERIVED_SAMPLE_SHORT}"
     exit 1
 }
 SAMPLE_DIR="/share/LCZX_Data/data/allcools/${SAMPLE_NAME}"
-QC_TAG="minmeth55_maxmethnone_maxsites10000000_covdedupprob"
+QC_TAG="minmeth55_maxmethnone_maxsites1200000_covdedupprob"
 THRESHOLD="${THRESHOLD:-30k}"
 QC_ROOT="${SAMPLE_DIR}/qc_${QC_TAG}"
 DATA_DIR="${DATA_DIR:-${QC_ROOT}/filtered_data_single_${THRESHOLD}}"
@@ -32,7 +32,7 @@ UPSTREAM_LOG_DIR="${QC_ROOT}/logs_single_${THRESHOLD}"
 SMOOTH_OK="${UPSTREAM_LOG_DIR}/smooth.ok"
 FILTER_PROVENANCE="${DATA_DIR}/filter_provenance.tsv"
 
-ANNOTATION_CSV="${ANNOTATION_CSV:-/share/home/rzli/SCANPY/20260810/Result0810/annotation/02_cell_annotation_all_cells.csv}"
+ANNOTATION_CSV="${ANNOTATION_CSV:-/share/home/rzli/SCANPY/20260814/Result0814/annotation/02_cell_annotation_all_cells.csv}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${QC_ROOT}/methdiff_celltype_${THRESHOLD}}"
 CONDA_INIT="${CONDA_INIT:-/share/home/rzli/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-scDNAm}"
