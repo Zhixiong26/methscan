@@ -13,3 +13,7 @@ __pycache__/
 
 # Claude Code local settings
 .claude/
+
+# Local archives and downloaded result artifacts
+archive_local/
+01_Upstream/result/

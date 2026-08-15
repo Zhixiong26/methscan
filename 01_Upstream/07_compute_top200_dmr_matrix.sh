@@ -5,7 +5,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RESULT_SCRIPT_DIR="${RESULT_SCRIPT_DIR:-${SCRIPT_DIR}/../02_Methdiff/Result}"
+RESULT_SCRIPT_DIR="${RESULT_SCRIPT_DIR:-${SCRIPT_DIR}/lib/methdiff/python}"
 BASE_DIR="${BASE_DIR:-/share/LCZX_Data/data/allcools}"
 THRESHOLD="${THRESHOLD:-300k}"
 QC_TAG="${QC_TAG:-minmeth55_maxmethnone_maxsites10000000_covdedupprob}"

@@ -7,10 +7,11 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${BASE_DIR:-/share/LCZX_Data/data/allcools}"
-DMR_SCRIPT="${DMR_SCRIPT:-${SCRIPT_DIR}/../02_Methdiff/run_single_sample_dmr.sh}"
+DMR_SCRIPT="${DMR_SCRIPT:-${SCRIPT_DIR}/lib/methdiff/run_single_sample_dmr.sh}"
+ANNOTATION_CSV="${ANNOTATION_CSV:-/share/home/rzli/SCANPY/20260810/Result0810/annotation/02_cell_annotation_all_cells.csv}"
 THRESHOLD="${THRESHOLD:-300k}"
 EXPECTED_SAMPLES="${EXPECTED_SAMPLES:-10}"
-DEFAULT_PREPARE_JOBS="${DEFAULT_PREPARE_JOBS:-10}"
+DEFAULT_PREPARE_JOBS="${DEFAULT_PREPARE_JOBS:-2}"
 DEFAULT_SAMPLE_JOBS="${DEFAULT_SAMPLE_JOBS:-2}"
 DEFAULT_COMPARISON_JOBS="${DEFAULT_COMPARISON_JOBS:-2}"
 DEFAULT_THREADS="${DEFAULT_THREADS:-24}"
@@ -24,12 +25,14 @@ Usage:
   bash 05_run_all_samples_dmr.sh summarize
 
 Examples:
-  bash 05_run_all_samples_dmr.sh prepare 10
+  bash 05_run_all_samples_dmr.sh prepare 2
   bash 05_run_all_samples_dmr.sh run 2 2 24
   bash 05_run_all_samples_dmr.sh status
 
 The run example permits at most 2 x 2 x 24 = 96 MethSCAn diff threads.
 All comparisons remain within one sample; no merged MethSCAn input is used.
+The default annotation is the Scanpy 20260810 Result0810 annotation. Override it
+with ANNOTATION_CSV=/path/to/02_cell_annotation_all_cells.csv when needed.
 EOF
 }
 
@@ -73,6 +76,7 @@ run_one_sample() {
 
     echo ">>> $short $action"
     env SAMPLE_NAME="$sample_name" SAMPLE_SHORT="$short" THRESHOLD="$THRESHOLD" \
+        ANNOTATION_CSV="$ANNOTATION_CSV" \
         bash "$DMR_SCRIPT" "$action" "$@"
 }
 
